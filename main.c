@@ -1078,11 +1078,15 @@ static int pg_all_gather_eager(pg_context_t *ctx, void *recvbuf, int count, DATA
 /* pg_all_reduce: protocol implementations + size-based router          */
 /* ------------------------------------------------------------------ */
 
+/* Strictly in-place: no memcpy. sendbuf/recvbuf must be the same pointer --
+ * reduce-scatter and all-gather both operate directly on that one buffer. */
 static int pg_all_reduce_rendezvous(pg_context_t *ctx, void *sendbuf, void *recvbuf,
                                      int count, DATATYPE dt, OPERATION op)
 {
-    size_t esz = dt_size(dt);
-    if (sendbuf != recvbuf) memcpy(recvbuf, sendbuf, (size_t) count * esz);
+    if (sendbuf != recvbuf) {
+        fprintf(stderr, "pg_all_reduce: library is strictly in-place; sendbuf must equal recvbuf\n");
+        return -1;
+    }
     if (ctx->world_size == 1) return 0;
     if (pg_reduce_scatter(ctx, recvbuf, count, dt, op)) return -1;
     if (pg_all_gather(ctx, recvbuf, count, dt)) return -1;
@@ -1092,8 +1096,10 @@ static int pg_all_reduce_rendezvous(pg_context_t *ctx, void *sendbuf, void *recv
 static int pg_all_reduce_eager(pg_context_t *ctx, void *sendbuf, void *recvbuf,
                                 int count, DATATYPE dt, OPERATION op)
 {
-    size_t esz = dt_size(dt);
-    if (sendbuf != recvbuf) memcpy(recvbuf, sendbuf, (size_t) count * esz);
+    if (sendbuf != recvbuf) {
+        fprintf(stderr, "pg_all_reduce: library is strictly in-place; sendbuf must equal recvbuf\n");
+        return -1;
+    }
     if (ctx->world_size == 1) return 0;
     if (pg_reduce_scatter_eager(ctx, recvbuf, count, dt, op)) return -1;
     if (pg_all_gather_eager(ctx, recvbuf, count, dt)) return -1;
@@ -1131,17 +1137,18 @@ static double now_ms(void)
  * automatically as long as they all call this with the same (size,
  * protocol) sequence -- which pg_autotune_threshold() guarantees by never
  * branching on a per-rank measurement mid-sweep. */
-static double time_protocol_ms(pg_context_t *ctx, void *sendbuf, void *recvbuf,
-                                int count, int use_eager)
+static double time_protocol_ms(pg_context_t *ctx, void *buf, int count, int use_eager)
 {
     for (int i = 0; i < AUTOTUNE_WARMUP; i++) {
-        if (use_eager) pg_all_reduce_eager(ctx, sendbuf, recvbuf, count, DT_FLOAT, OP_SUM);
-        else            pg_all_reduce_rendezvous(ctx, sendbuf, recvbuf, count, DT_FLOAT, OP_SUM);
+        memset(buf, 0, (size_t) count * sizeof(float));
+        if (use_eager) pg_all_reduce_eager(ctx, buf, buf, count, DT_FLOAT, OP_SUM);
+        else            pg_all_reduce_rendezvous(ctx, buf, buf, count, DT_FLOAT, OP_SUM);
     }
     double t0 = now_ms();
     for (int i = 0; i < AUTOTUNE_TRIALS; i++) {
-        if (use_eager) pg_all_reduce_eager(ctx, sendbuf, recvbuf, count, DT_FLOAT, OP_SUM);
-        else            pg_all_reduce_rendezvous(ctx, sendbuf, recvbuf, count, DT_FLOAT, OP_SUM);
+        memset(buf, 0, (size_t) count * sizeof(float));
+        if (use_eager) pg_all_reduce_eager(ctx, buf, buf, count, DT_FLOAT, OP_SUM);
+        else            pg_all_reduce_rendezvous(ctx, buf, buf, count, DT_FLOAT, OP_SUM);
     }
     double t1 = now_ms();
     return (t1 - t0) / AUTOTUNE_TRIALS;
@@ -1164,14 +1171,11 @@ int pg_autotune_threshold(void *pg_handle)
     if (!ctx) return -1;
 
     size_t max_bytes = AUTOTUNE_MAX_BYTES;
-    void *sendbuf = malloc(max_bytes);
-    void *recvbuf = malloc(max_bytes);
-    if (!sendbuf || !recvbuf) {
+    void *buf = malloc(max_bytes);
+    if (!buf) {
         fprintf(stderr, "rank %d: autotune alloc failed\n", ctx->rank);
-        free(sendbuf); free(recvbuf);
         return -1;
     }
-    memset(sendbuf, 0, max_bytes);
 
     if (ctx->rank == 0)
         fprintf(stderr, "[rank 0] auto-tuning eager/rendezvous crossover "
@@ -1184,8 +1188,8 @@ int pg_autotune_threshold(void *pg_handle)
         int count = (int) (bytes / sizeof(float));
         if (count < 1) count = 1;
 
-        double t_eager = time_protocol_ms(ctx, sendbuf, recvbuf, count, 1);
-        double t_rend  = time_protocol_ms(ctx, sendbuf, recvbuf, count, 0);
+        double t_eager = time_protocol_ms(ctx, buf, count, 1);
+        double t_rend  = time_protocol_ms(ctx, buf, count, 0);
 
         if (ctx->rank == 0) {
             fprintf(stderr, "  size=%8zu B  eager=%9.4f ms  rendezvous=%9.4f ms  -> %s\n",
@@ -1202,8 +1206,7 @@ int pg_autotune_threshold(void *pg_handle)
         }
     }
 
-    free(sendbuf);
-    free(recvbuf);
+    free(buf);
 
     size_t agreed = threshold;
     if (broadcast_from_rank0(ctx, &agreed)) {
@@ -1281,9 +1284,8 @@ static int tune_pipe_segs(void *pg_handle, int rank, int nhosts, int iters)
     const int nsizes = (int) (sizeof sizes / sizeof sizes[0]);
     const size_t max_bytes = sizes[nsizes - 1];
 
-    float *sendbuf = malloc(max_bytes), *recvbuf = malloc(max_bytes);
-    if (!sendbuf || !recvbuf) { fprintf(stderr, "alloc failed\n"); free(sendbuf); free(recvbuf); return -1; }
-    for (size_t i = 0; i < max_bytes / sizeof(float); i++) sendbuf[i] = (float) (rank + 1);
+    float *recvbuf = malloc(max_bytes);
+    if (!recvbuf) { fprintf(stderr, "alloc failed\n"); return -1; }
 
     double expected = 0.0;
     for (int p = 0; p < nhosts; p++) expected += (p + 1);
@@ -1304,12 +1306,15 @@ static int tune_pipe_segs(void *pg_handle, int rank, int nhosts, int iters)
         for (int k = 0; k < nsegs; k++) {
             g_pipe_segs = segs[k];
 
-            for (int w = 0; w < WARMUP_ITERS; w++)
-                pg_all_reduce(sendbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle);
+            for (int w = 0; w < WARMUP_ITERS; w++) {
+                for (int i = 0; i < count; i++) recvbuf[i] = (float) (rank + 1);
+                pg_all_reduce(recvbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle);
+            }
 
             double t0 = now_ms();
             for (int it = 0; it < iters; it++) {
-                if (pg_all_reduce(sendbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle)) {
+                for (int i = 0; i < count; i++) recvbuf[i] = (float) (rank + 1);
+                if (pg_all_reduce(recvbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle)) {
                     fprintf(stderr, "pg_all_reduce failed (size=%zu, PIPE_SEGS=%d)\n",
                             sizes[s], g_pipe_segs);
                     rc = -1;
@@ -1333,7 +1338,6 @@ static int tune_pipe_segs(void *pg_handle, int rank, int nhosts, int iters)
     }
     g_pipe_segs = saved;
 
-    free(sendbuf);
     free(recvbuf);
     return rc;
 }
@@ -1412,12 +1416,8 @@ int main(int argc, char *argv[])
     const size_t max_bytes = sizes[nsizes - 1];
 
     int rank = my_index - 1;
-    float *sendbuf = malloc(max_bytes);
     float *recvbuf = malloc(max_bytes);
-    if (!sendbuf || !recvbuf) { fprintf(stderr, "alloc failed\n"); return 1; }
-
-    /* sendbuf is never modified by all_reduce, so fill it once */
-    for (size_t i = 0; i < max_bytes / sizeof(float); i++) sendbuf[i] = (float) (rank + 1);
+    if (!recvbuf) { fprintf(stderr, "alloc failed\n"); return 1; }
 
     double expected = 0.0;
     for (int p = 0; p < nhosts; p++) expected += (p + 1);
@@ -1427,12 +1427,15 @@ int main(int argc, char *argv[])
 
         /* Warmup: a few untimed calls so the timed loop doesn't pay one-time
          * costs (first-touch page faults, MR registration, cold NIC paths). */
-        for (int w = 0; w < WARMUP_ITERS; w++)
-            pg_all_reduce(sendbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle);
+        for (int w = 0; w < WARMUP_ITERS; w++) {
+            for (int i = 0; i < count; i++) recvbuf[i] = (float) (rank + 1);
+            pg_all_reduce(recvbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle);
+        }
 
         double t0 = now_ms();
         for (int it = 0; it < iters; it++) {
-            if (pg_all_reduce(sendbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle)) {
+            for (int i = 0; i < count; i++) recvbuf[i] = (float) (rank + 1);
+            if (pg_all_reduce(recvbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle)) {
                 fprintf(stderr, "pg_all_reduce failed\n");
                 return 1;
             }
@@ -1449,7 +1452,6 @@ int main(int argc, char *argv[])
                rank, sizes[s], iters, total_ms, total_ms / iters, ok ? "OK" : "MISMATCH");
     }
 
-    free(sendbuf);
     free(recvbuf);
     pg_close(pg_handle);
     return 0;
