@@ -13,7 +13,7 @@
  *   int pg_close(void *pg_handle);
  *
  * CLI:
- *   test -myindex <1-based index> -list <host1> <host2> ... [-c count] [-n iters]
+ *   test -myindex <1-based index> -list <host1> <host2> ... [-n iters]
  */
 
 #include <stdio.h>
@@ -38,14 +38,18 @@
 /* Constants                                                          */
 /* ------------------------------------------------------------------ */
 
-#define MAX_PROCESSES   32
+#define MAX_PROCESSES   4
 #define TCP_BASE_PORT   18800   /* rank r listens on TCP_BASE_PORT + r  */
 #define IB_PORT_DEFAULT 1
 #define CQ_SIZE         512
 #define SQ_DEPTH        64
 #define RQ_DEPTH        64
 #define WC_BATCH        16
-#define PIPE_SEGS       4       /* pipeline segments per ring chunk     */
+/* TEMP (-tune-pipe): PIPE_SEGS is a runtime variable while tuning.
+ * When done, delete these two lines and restore:
+ *   #define PIPE_SEGS       4       (pipeline segments per ring chunk) */
+static int g_pipe_segs = 16;
+#define PIPE_SEGS       g_pipe_segs
 #define CONNECT_RETRIES 200     /* ~20s of retries at 100ms backoff     */
 
 /* Eager protocol: persistent stage buffer, sized generously enough to hold
@@ -62,6 +66,7 @@
 
 #define WARMUP_ITERS 5   /* main()'s pre-benchmark warmup, ask #1 */
 
+#define BENCH_ITERS  1000   /* timed pg_all_reduce() calls per size in main() */
 /* ------------------------------------------------------------------ */
 /* Public collective-op types                                         */
 /* ------------------------------------------------------------------ */
@@ -1260,10 +1265,84 @@ int pg_close(void *pg_handle)
 /* CLI / driver                                                         */
 /* ------------------------------------------------------------------ */
 
+/* ==================== TEMP: -tune-pipe (delete when done) ==================== */
+/* For each message size, times `iters` pg_all_reduce() calls for each
+ * candidate PIPE_SEGS value. Every rank walks the same lists in the same
+ * order, so the whole ring always uses the same segment count. Max is 64:
+ * each step posts up to PIPE_SEGS writes/recvs (SQ_DEPTH/RQ_DEPTH = 64) and
+ * the segment index travels in 8 bits of the immediate. Sizes start at
+ * 16 KB: below that the chunks are so small that segmenting barely matters. */
+static int tune_pipe_segs(void *pg_handle, int rank, int nhosts, int iters)
+{
+    pg_context_t *ctx = pg_handle;
+    static const int    segs[]  = { 4, 8, 16, 32, 64 };
+    static const size_t sizes[] = { 16 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024 };
+    const int nsegs  = (int) (sizeof segs / sizeof segs[0]);
+    const int nsizes = (int) (sizeof sizes / sizeof sizes[0]);
+    const size_t max_bytes = sizes[nsizes - 1];
+
+    float *sendbuf = malloc(max_bytes), *recvbuf = malloc(max_bytes);
+    if (!sendbuf || !recvbuf) { fprintf(stderr, "alloc failed\n"); free(sendbuf); free(recvbuf); return -1; }
+    for (size_t i = 0; i < max_bytes / sizeof(float); i++) sendbuf[i] = (float) (rank + 1);
+
+    double expected = 0.0;
+    for (int p = 0; p < nhosts; p++) expected += (p + 1);
+
+    if (rank == 0) {
+        printf("\n[tune-pipe] total ms for %d x pg_all_reduce (* = fastest for that size)\n", iters);
+        printf("%10s %-10s", "size [B]", "router");
+        for (int k = 0; k < nsegs; k++) printf("   segs=%-6d", segs[k]);
+        printf("\n");
+    }
+
+    int saved = g_pipe_segs, rc = 0;
+    for (int s = 0; s < nsizes && rc == 0; s++) {
+        int count = (int) (sizes[s] / sizeof(float));
+        double t[sizeof segs / sizeof segs[0]];
+        int ok = 1, best = 0;
+
+        for (int k = 0; k < nsegs; k++) {
+            g_pipe_segs = segs[k];
+
+            for (int w = 0; w < WARMUP_ITERS; w++)
+                pg_all_reduce(sendbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle);
+
+            double t0 = now_ms();
+            for (int it = 0; it < iters; it++) {
+                if (pg_all_reduce(sendbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle)) {
+                    fprintf(stderr, "pg_all_reduce failed (size=%zu, PIPE_SEGS=%d)\n",
+                            sizes[s], g_pipe_segs);
+                    rc = -1;
+                    break;
+                }
+            }
+            if (rc) break;
+            t[k] = now_ms() - t0;
+            if (t[k] < t[best]) best = k;
+
+            for (int i = 0; i < count; i++)
+                if (fabs((double) recvbuf[i] - expected) > 1e-3) { ok = 0; break; }
+        }
+
+        if (rank == 0 && rc == 0) {
+            printf("%10zu %-10s", sizes[s], sizes[s] < ctx->eager_threshold_bytes ? "eager" : "rendezvous");
+            for (int k = 0; k < nsegs; k++) printf(" %11.3f%c ", t[k], k == best ? '*' : ' ');
+            printf("%s\n", ok ? "" : " MISMATCH");
+            fflush(stdout);
+        }
+    }
+    g_pipe_segs = saved;
+
+    free(sendbuf);
+    free(recvbuf);
+    return rc;
+}
+/* ================== end TEMP: -tune-pipe ================== */
+
 static void usage(const char *argv0)
 {
     printf("Usage:\n");
-    printf("  %s -myindex <1-based index> -list <host1> <host2> ... [-c count] [-n iters]\n", argv0);
+    printf("  %s -myindex <1-based index> -list <host1> <host2> ... [-n iters]\n", argv0);
     printf("\nExample (4 processes):\n");
     printf("  <mlxstud01> %s -myindex 1 -list mlxstud01 mlxstud02 mlxstud03 mlxstud04\n", argv0);
 }
@@ -1273,8 +1352,8 @@ int main(int argc, char *argv[])
     int   my_index = -1;
     char *hostlist[MAX_PROCESSES];
     int   nhosts = 0;
-    int   count  = 1 << 20;   /* default element count for the self-test */
-    int   iters  = 1;
+    int   iters  = BENCH_ITERS;
+    int   tune_pipe = 0;   /* TEMP: -tune-pipe */
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-myindex") && i + 1 < argc) {
@@ -1286,10 +1365,10 @@ int main(int argc, char *argv[])
                 hostlist[nhosts++] = argv[i++];
             }
             i--; /* outer loop will re-increment */
-        } else if (!strcmp(argv[i], "-c") && i + 1 < argc) {
-            count = (int) strtol(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "-n") && i + 1 < argc) {
             iters = (int) strtol(argv[++i], NULL, 10);
+        } else if (!strcmp(argv[i], "-tune-pipe")) {   /* TEMP */
+            tune_pipe = 1;
         } else {
             fprintf(stderr, "Unrecognized option: %s\n", argv[i]);
             usage(argv[0]);
@@ -1297,7 +1376,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (my_index < 1 || nhosts < 2 || my_index > nhosts) {
+    if (my_index < 1 || nhosts < 2 || my_index > nhosts || iters < 1) {
         usage(argv[0]);
         return 1;
     }
@@ -1318,50 +1397,56 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* TEMP: -tune-pipe runs the PIPE_SEGS sweep instead of the benchmark */
+    if (tune_pipe) {
+        int rc = tune_pipe_segs(pg_handle, my_index - 1, nhosts, iters);
+        pg_close(pg_handle);
+        return rc ? 1 : 0;
+    }
+
+    /* Interesting sizes: a single float (pure latency), a small message
+     * (Eager territory), mid-size, a large message (Rendezvous / bandwidth),
+     * and the largest size the Eager stage buffer was sized for. */
+    static const size_t sizes[] = { 4, 1024, 16 * 1024, 1024 * 1024, 4 * 1024 * 1024 };
+    const int nsizes = (int) (sizeof sizes / sizeof sizes[0]);
+    const size_t max_bytes = sizes[nsizes - 1];
+
     int rank = my_index - 1;
-    float *sendbuf = malloc(sizeof(float) * (size_t) count);
-    float *recvbuf = malloc(sizeof(float) * (size_t) count);
+    float *sendbuf = malloc(max_bytes);
+    float *recvbuf = malloc(max_bytes);
     if (!sendbuf || !recvbuf) { fprintf(stderr, "alloc failed\n"); return 1; }
+
+    /* sendbuf is never modified by all_reduce, so fill it once */
+    for (size_t i = 0; i < max_bytes / sizeof(float); i++) sendbuf[i] = (float) (rank + 1);
 
     double expected = 0.0;
     for (int p = 0; p < nhosts; p++) expected += (p + 1);
 
-    /* Warmup: run the real all_reduce a few times, untimed and unprinted,
-     * so the FIRST timed iteration below isn't skewed by one-time costs
-     * this run hasn't paid yet -- page faults on first-touch of sendbuf/
-     * recvbuf, lazy NIC/driver paths, and (for whichever protocol this
-     * count routes to) its warm-vs-cold behavior. */
-    for (int i = 0; i < count; i++) sendbuf[i] = (float) (rank + 1);
-    for (int w = 0; w < WARMUP_ITERS; w++) {
-        pg_all_reduce(sendbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle);
-    }
+    for (int s = 0; s < nsizes; s++) {
+        int count = (int) (sizes[s] / sizeof(float));
 
-    for (int it = 0; it < iters; it++) {
-        for (int i = 0; i < count; i++) sendbuf[i] = (float) (rank + 1);
+        /* Warmup: a few untimed calls so the timed loop doesn't pay one-time
+         * costs (first-touch page faults, MR registration, cold NIC paths). */
+        for (int w = 0; w < WARMUP_ITERS; w++)
+            pg_all_reduce(sendbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle);
 
-        struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        if (pg_all_reduce(sendbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle)) {
-            fprintf(stderr, "pg_all_reduce failed\n");
-            return 1;
+        double t0 = now_ms();
+        for (int it = 0; it < iters; it++) {
+            if (pg_all_reduce(sendbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle)) {
+                fprintf(stderr, "pg_all_reduce failed\n");
+                return 1;
+            }
         }
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        double total_ms = now_ms() - t0;
 
-        int ok = 1, bad_idx = -1;
+        /* Verify the last result (outside the timer) */
+        int ok = 1;
         for (int i = 0; i < count; i++) {
-            if (fabs((double) recvbuf[i] - expected) > 1e-3) { ok = 0; bad_idx = i; break; }
+            if (fabs((double) recvbuf[i] - expected) > 1e-3) { ok = 0; break; }
         }
 
-        if (ok) {
-            printf("[rank %d] iter %d: all_reduce(count=%d) took %.3f ms -> OK "
-                   "(recvbuf[0]=%.2f expected=%.2f)\n",
-                   rank, it, count, ms, recvbuf[0], expected);
-        } else {
-            printf("[rank %d] iter %d: all_reduce(count=%d) took %.3f ms -> MISMATCH "
-                   "at index %d (got %.6f expected %.6f)\n",
-                   rank, it, count, ms, bad_idx, (double) recvbuf[bad_idx], expected);
-        }
+        printf("[rank %d] size=%8zu B: %d x all_reduce took %.3f ms total (%.4f ms avg) -> %s\n",
+               rank, sizes[s], iters, total_ms, total_ms / iters, ok ? "OK" : "MISMATCH");
     }
 
     free(sendbuf);
