@@ -693,7 +693,7 @@ static void rs_seg_cb(void *user, uint64_t wr_id)
     reduce_apply(dst, src, seg_len, rc->dt, rc->op);
 }
 
-static int pg_reduce_scatter(pg_context_t *ctx, void *recvbuf, int count, DATATYPE dt, OPERATION op)
+static int pg_reduce_scatter_rendezvous(pg_context_t *ctx, void *recvbuf, int count, DATATYPE dt, OPERATION op)
 {
     int N = ctx->world_size, r = ctx->rank;
     size_t esz = dt_size(dt);
@@ -817,7 +817,7 @@ static int pg_reduce_scatter(pg_context_t *ctx, void *recvbuf, int count, DATATY
 /* recvbuf -- no staging buffer, no memcpy on either side.              */
 /* ------------------------------------------------------------------ */
 
-static int pg_all_gather(pg_context_t *ctx, void *recvbuf, int count, DATATYPE dt)
+static int pg_all_gather_rendezvous(pg_context_t *ctx, void *recvbuf, int count, DATATYPE dt)
 {
     int N = ctx->world_size, r = ctx->rank;
     size_t esz = dt_size(dt);
@@ -1088,8 +1088,8 @@ static int pg_all_reduce_rendezvous(pg_context_t *ctx, void *sendbuf, void *recv
         return -1;
     }
     if (ctx->world_size == 1) return 0;
-    if (pg_reduce_scatter(ctx, recvbuf, count, dt, op)) return -1;
-    if (pg_all_gather(ctx, recvbuf, count, dt)) return -1;
+    if (pg_reduce_scatter_rendezvous(ctx, recvbuf, count, dt, op)) return -1;
+    if (pg_all_gather_rendezvous(ctx, recvbuf, count, dt)) return -1;
     return 0;
 }
 
