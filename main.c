@@ -44,9 +44,18 @@
 #define MAX_PROCESSES   4
 #define TCP_BASE_PORT   18800   /* rank r listens on TCP_BASE_PORT + r  */
 #define IB_PORT_DEFAULT 1
-#define CQ_SIZE         512
-#define SQ_DEPTH        64
-#define RQ_DEPTH        64
+/* These were 512/64/64 originally. Raised substantially: qp_next/qp_prev's
+ * send and receive queues are now shared by several concurrent protocols
+ * (reduce-scatter's credit-return traffic, all-gather's data writes AND its
+ * metadata-announcement handshake), and a deadlock was observed that moved
+ * to a LATER message size under a slower (-O0 debug) build despite running
+ * the exact same deterministic call sequence -- a hang that shifts later
+ * when the program runs slower is the signature of a timing-sensitive
+ * resource race, not a fixed-count leak, so the fix is headroom: make it
+ * far harder for any of these shared queues to run transiently dry. */
+#define CQ_SIZE         8192
+#define SQ_DEPTH        2048
+#define RQ_DEPTH        2048
 #define WC_BATCH        16
 /* TEMP (-tune-pipe): PIPE_SEGS is a runtime variable while tuning.
  * When done, delete these two lines and restore:
@@ -383,6 +392,34 @@ static int exchange_landing_info(pg_context_t *ctx,
 {
     if (send_all(ctx->sock_prev, my_landing, sizeof *my_landing)) return -1;
     if (recv_all(ctx->sock_next, next_landing_out, sizeof *next_landing_out)) return -1;
+    return 0;
+}
+
+/* Barrier against BOTH ring neighbours, over the TCP control sockets (never
+ * the RDMA queues). Reduce-Scatter's incoming data and All-Gather's incoming
+ * data land as the IDENTICAL completion signature -- IBV_WC_RECV_RDMA_WITH_IMM
+ * on qp_prev -- so there is no way, once a completion has arrived, to tell a
+ * late Reduce-Scatter segment apart from a genuine All-Gather one. If one
+ * rank moves into pg_all_gather_rendezvous() while its neighbour is still
+ * mid-Reduce-Scatter, that neighbour's still-in-flight Reduce-Scatter writes
+ * get miscounted as All-Gather arrivals, got_recv reaches nsegs_in on a
+ * phantom event, and the real All-Gather data that should have come from
+ * that neighbour never does -- a deadlock whose exact trigger point shifts
+ * with timing (this is what was observed: a hang that moved to a later
+ * message size under a slower build, despite identical call counts). This
+ * barrier closes that gap at its only possible entry point: called right
+ * after Reduce-Scatter returns and right before All-Gather starts
+ * repurposing qp_prev/qp_next, it guarantees both direct neighbours have
+ * also fully returned from their own Reduce-Scatter call first. Send-then-
+ * receive-from-both is deadlock-free here because every rank runs the exact
+ * same sequence: TCP sends complete locally (buffered) without waiting on
+ * the peer to read, so all four ranks' sends land before any of their
+ * receives are attempted. */
+static int neighbor_barrier(pg_context_t *ctx)
+{
+    char tok = 1;
+    if (send_all(ctx->sock_next, &tok, 1) || send_all(ctx->sock_prev, &tok, 1)) return -1;
+    if (recv_all(ctx->sock_next, &tok, 1) || recv_all(ctx->sock_prev, &tok, 1)) return -1;
     return 0;
 }
 
@@ -1640,6 +1677,11 @@ static int pg_all_reduce_rendezvous(pg_context_t *ctx, const void *sendbuf, void
 {
     if (ctx->world_size == 1) return 0;
     if (pg_reduce_scatter_rendezvous(ctx, sendbuf, recvbuf, count, dt, op)) return -1;
+    /* See neighbor_barrier()'s comment: Reduce-Scatter and All-Gather data
+     * are indistinguishable once they land on qp_prev, so both of this
+     * rank's direct neighbours must have also finished Reduce-Scatter
+     * before All-Gather starts reusing the same QPs. */
+    if (neighbor_barrier(ctx)) return -1;
     if (pg_all_gather_rendezvous(ctx, recvbuf, count, dt)) return -1;
     return 0;
 }
