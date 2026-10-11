@@ -1904,10 +1904,10 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* Interesting sizes: a single float (pure latency), a small message
-     * (Eager territory), mid-size, a large message (Rendezvous / bandwidth),
-     * and the largest size the Eager stage buffer was sized for. */
-    static const size_t sizes[] = { 4, 1024, 16 * 1024, 1024 * 1024, 4 * 1024 * 1024 };
+    /* 10 sizes from 16 B up to 4 MB (x4 each step); 4 MB is the largest size
+     * the Eager stage buffer was sized for. */
+    static const size_t sizes[] = { 16, 64, 256, 1024, 4 * 1024, 16 * 1024, 64 * 1024,
+                                    256 * 1024, 1024 * 1024, 4 * 1024 * 1024 };
     const int nsizes = (int) (sizeof sizes / sizeof sizes[0]);
     const size_t max_bytes = sizes[nsizes - 1];
 
