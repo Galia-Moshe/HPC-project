@@ -61,6 +61,21 @@ static int g_pipe_segs = 16;
  * auto-tuner's max message size covers every N. */
 #define EAGER_STAGE_BYTES (4 * 1024 * 1024)
 
+/* Rendezvous reduce-scatter: persistent ring buffer + RDMA credit-based flow
+ * control. RZV_RING_SEGS is the ring's capacity in segments; RZV_STAGE_BYTES
+ * is sized for the biggest chunk the benchmark/auto-tuner will ever try (same
+ * rationale as EAGER_STAGE_BYTES above), divided into RZV_RING_SEGS equal
+ * slots of RZV_SEG_BYTES each. RZV_CREDIT_BATCH is how many freed segments
+ * the receiver accumulates before returning credits in one message. */
+#define RZV_RING_SEGS    16
+#define RZV_STAGE_BYTES  (4 * 1024 * 1024)
+#define RZV_SEG_BYTES    (RZV_STAGE_BYTES / RZV_RING_SEGS)
+#define RZV_CREDIT_BATCH 4
+/* Upper bound on segments sent/received across a WHOLE pg_reduce_scatter_
+ * rendezvous() call (all N-1 ring steps flattened together): at most
+ * RZV_RING_SEGS segments per step, for at most MAX_PROCESSES-1 steps. */
+#define RZV_MAX_SEGS_PER_CALL ((MAX_PROCESSES - 1) * RZV_RING_SEGS)
+
 /* Eager/Rendezvous auto-tuning sweep range and per-size sample counts. */
 #define AUTOTUNE_MIN_BYTES 4
 #define AUTOTUNE_MAX_BYTES (4 * 1024 * 1024)
@@ -127,7 +142,16 @@ typedef struct {
     struct ibv_mr *eager_stage_mr;
     size_t         eager_stage_bytes;
 
-    /* MR caches for stable output/input buffers reused across collectives. */
+    /* --- Rendezvous reduce-scatter: persistent ring buffer + RDMA
+     * credit-based flow control. Allocated/registered/exchanged exactly
+     * once, here in connect_process_group(), for the process group's whole
+     * lifetime -- no more malloc/ibv_reg_mr/TCP landing-info exchange on
+     * every pg_reduce_scatter_rendezvous() call. */
+    void            *rzv_stage;          /* local ring buffer: RZV_RING_SEGS slots of RZV_SEG_BYTES */
+    struct ibv_mr   *rzv_stage_mr;
+    struct buf_info  remote_rzv_stage;    /* next rank's ring buffer: addr/rkey/size to RDMA-Write into */
+
+    /* MR cache for a stable output buffer reused across collectives. */
     void          *eager_mr_ptr;
     size_t         eager_mr_size;
     struct ibv_mr *eager_mr;
@@ -193,8 +217,7 @@ static size_t dt_size(DATATYPE dt)
             d[_i] = EXPR(local[_i], incoming[_i]);                  \
     } while (0)
 
-/* Seed a newly received chunk without copying the local input first:
- * dst[i] = local_src[i] OP incoming_src[i]. */
+/* Seed a reduced chunk without copying local input first. */
 static void reduce_seed(void *dst, const void *local_src, const void *incoming_src,
                         int n, DATATYPE dt, OPERATION op)
 {
@@ -676,13 +699,50 @@ int connect_process_group(char *servername, void **pg_handle)
                                       ctx->eager_stage_bytes, IBV_ACCESS_LOCAL_WRITE);
     if (!ctx->eager_stage_mr) { fprintf(stderr, "rank %d: eager stage MR reg failed\n", rank); return -1; }
 
+    /* Rendezvous reduce-scatter's ring buffer: same one-time setup pattern
+     * as the Eager stage buffer above, except its (addr, rkey) also has to
+     * be handed to next over the already-open control sockets -- Eager
+     * never needs that exchange at all (two-sided Send/Recv), but a
+     * one-sided RDMA Write always needs the target's (addr, rkey) in hand
+     * before it can be posted. Doing it once, here, is what lets
+     * pg_reduce_scatter_rendezvous() skip the malloc/ibv_reg_mr/TCP
+     * round trip it used to pay on every single call. */
+    ctx->rzv_stage = malloc(RZV_STAGE_BYTES);
+    if (!ctx->rzv_stage) { fprintf(stderr, "rank %d: rzv stage alloc failed\n", rank); return -1; }
+    ctx->rzv_stage_mr = ibv_reg_mr(ctx->pd, ctx->rzv_stage, RZV_STAGE_BYTES,
+                                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    if (!ctx->rzv_stage_mr) { fprintf(stderr, "rank %d: rzv stage MR reg failed\n", rank); return -1; }
+
+    struct buf_info my_rzv_landing = { .addr = (uint64_t) ctx->rzv_stage,
+                                        .rkey = ctx->rzv_stage_mr->rkey,
+                                        .size = (uint32_t) RZV_STAGE_BYTES };
+    if (exchange_landing_info(ctx, &my_rzv_landing, &ctx->remote_rzv_stage)) {
+        fprintf(stderr, "rank %d: rzv stage landing-info exchange failed\n", rank);
+        return -1;
+    }
+
+    /* Pre-post dummy (zero-SGE) receives on qp_next to catch incoming
+     * credit-return messages from next (0-byte IBV_WR_SEND_WITH_IMM) --
+     * required so next's credit sends never hit an RNR on us. qp_next's
+     * receive queue is otherwise unused (Eager only ever posts its
+     * two-sided recvs on qp_prev), so these RQ_DEPTH placeholders are
+     * dedicated entirely to credit traffic and kept topped up for the
+     * process group's lifetime: every time pg_reduce_scatter_rendezvous()
+     * consumes one, it posts a replacement immediately. */
+    for (int i = 0; i < RQ_DEPTH; i++) {
+        if (post_dummy_recv(ctx->qp_next, (uint64_t) i)) {
+            fprintf(stderr, "rank %d: initial credit-recv pre-post failed\n", rank);
+            return -1;
+        }
+    }
+
     *pg_handle = ctx;
     return 0;
 }
 
 /* ------------------------------------------------------------------ */
-/* Reduce-Scatter: pipelined. Incoming segments land in stage; the CPU  */
-/* combines each with this rank's sendbuf contribution into recvbuf.    */
+/* Eager Reduce-Scatter: incoming segments land in stage; the CPU combines */
+/* each one with the local sendbuf contribution into recvbuf.              */
 /* ------------------------------------------------------------------ */
 
 struct rs_ctx {
@@ -710,6 +770,162 @@ static void rs_seg_cb(void *user, uint64_t wr_id)
     reduce_seed(dst, local, incoming, seg_len, rc->dt, rc->op);
 }
 
+/* ------------------------------------------------------------------ */
+/* Reduce-Scatter (Rendezvous): a single continuous, free-running pipeline */
+/* over a persistent ring buffer, with RDMA credit-based flow control as   */
+/* the only back-pressure -- there is no per-step barrier. All N-1 ring    */
+/* steps' segments are flattened up front (see out_segs/in_segs below)     */
+/* into one global send order and one global receive order; the k-th      */
+/* segment either side ever sends/receives (across the WHOLE call, not    */
+/* just one step) lands in ring slot k % RZV_RING_SEGS. Both sides agree   */
+/* on that slot without exchanging anything, because RC delivers writes    */
+/* in the exact order they were posted -- so wr_id alone is a reliable     */
+/* global index into the flattened arrays on arrival.                      */
+/*                                                                          */
+/* Flow control is credit-based instead of the old TCP ack: `credits`      */
+/* tracks how many of NEXT's ring slots are currently free for ME to       */
+/* write into (starts at RZV_RING_SEGS -- the whole ring -- since the      */
+/* previous call always drains back to full before it returns). Every      */
+/* write consumes one credit; credits are replenished only when NEXT        */
+/* explicitly returns them via a 0-byte IBV_WR_SEND_WITH_IMM, batched in    */
+/* groups of RZV_CREDIT_BATCH so we're not paying a two-sided round trip    */
+/* for every single segment. A segment advances when its prior-step         */
+/* reduction is ready and a credit is available, allowing useful overlap   */
+/* while still preserving the Reduce-Scatter data dependencies.             */
+/* ------------------------------------------------------------------ */
+
+/* One entry per segment, in global send/receive order across the WHOLE
+ * call (every ring step flattened together) -- `offset`/`len` are element
+ * offsets/lengths into recvbuf. Precomputed once per call so the hot loop
+ * below never has to re-derive step boundaries: slot assignment is then
+ * simply "index into this array" % RZV_RING_SEGS. */
+struct rzv_seg_desc {
+    int offset;
+    int len;
+    int from_sendbuf;
+    int produces_out;
+};
+
+struct rzv_rs_ctx {
+    pg_context_t               *ctx;
+    const void                 *sendbuf;
+    void                       *recvbuf;
+    DATATYPE                    dt;
+    OPERATION                   op;
+    const struct rzv_seg_desc  *in_segs;
+    int                        *out_ready;
+};
+
+/* Reduces ring slot (wr_id % RZV_RING_SEGS) -- where prev just wrote the
+ * wr_id-th segment of the WHOLE call (not just the current step) -- into
+ * recvbuf, using the precomputed descriptor for that global index. RC's
+ * ordered delivery is what makes wr_id a reliable global index: prev's
+ * writes land on qp_prev in exactly the order prev issued them. */
+static void rzv_seg_cb(struct rzv_rs_ctx *rc, uint64_t wr_id)
+{
+    const struct rzv_seg_desc *seg = &rc->in_segs[wr_id];
+    size_t esz = dt_size(rc->dt);
+    uint64_t slot = wr_id % RZV_RING_SEGS;
+    void *dst = (char *) rc->recvbuf + (size_t) seg->offset * esz;
+    const void *local = (const char *) rc->sendbuf + (size_t) seg->offset * esz;
+    const void *incoming = (const char *) rc->ctx->rzv_stage + (size_t) slot * RZV_SEG_BYTES;
+    reduce_seed(dst, local, incoming, seg->len, rc->dt, rc->op);
+    if (seg->produces_out >= 0)
+        rc->out_ready[seg->produces_out] = 1;
+}
+
+/* 0-byte IBV_WR_SEND_WITH_IMM: the credit-return message. freed_count rides
+ * entirely in imm_data -- there is no payload to carry. */
+static int post_credit_return(struct ibv_qp *qp, uint32_t freed_count, uint64_t wr_id)
+{
+    struct ibv_send_wr wr, *bad;
+    memset(&wr, 0, sizeof wr);
+    wr.wr_id      = wr_id;
+    wr.opcode     = IBV_WR_SEND_WITH_IMM;
+    wr.sg_list    = NULL;
+    wr.num_sge    = 0;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.imm_data   = htonl(freed_count);
+    return ibv_post_send(qp, &wr, &bad);
+}
+
+/* Polls the CQ once and dispatches every completion found on it:
+ *   qp_prev + IBV_WC_RECV_RDMA_WITH_IMM -> a data segment landed: reduce it
+ *                                          (*got_recv)++, bump the local
+ *                                          free-batch, and flush a
+ *                                          credit-return once the batch
+ *                                          reaches RZV_CREDIT_BATCH.
+ *   qp_prev + IBV_WC_SEND               -> our own credit-return to prev
+ *                                          completed: (*credit_sends_pending)--.
+ *   qp_next + IBV_WC_RECV                -> a credit-return arrived from
+ *                                          next: add the freed count to
+ *                                          our send credits and
+ *                                          immediately re-post the dummy
+ *                                          recv so the next one never RNRs.
+ *   qp_next + IBV_WC_RDMA_WRITE           -> our own data write to next
+ *                                          completed: (*got_send)++.
+ * Credit traffic is handled inline and never counts toward *got_send/
+ * *got_recv, which track DATA completions only. *credit_sends_pending
+ * exists so the caller can wait for every credit-return SEND it posted to
+ * actually complete before returning -- otherwise a late completion for
+ * one of OUR OWN credit-return sends could still be sitting unconsumed in
+ * the CQ when the next phase (e.g. pg_all_gather_rendezvous) starts
+ * polling it, and its drain_step() has no idea credit traffic exists: it
+ * blindly counts anything on qp_prev as incoming data, miscounting that
+ * leftover completion and desyncing the whole phase. */
+static int rzv_poll_once(pg_context_t *ctx, struct rzv_rs_ctx *rc,
+                          int *got_send, int *got_recv,
+                          int *credits, int *freed_batch,
+                          int *credit_sends_pending)
+{
+    struct ibv_wc wc[WC_BATCH];
+    int ne = ibv_poll_cq(ctx->cq, WC_BATCH, wc);
+    if (ne < 0) { fprintf(stderr, "poll_cq failed\n"); return -1; }
+
+    for (int i = 0; i < ne; i++) {
+        if (wc[i].status != IBV_WC_SUCCESS) {
+            const char *role =
+                (wc[i].qp_num == ctx->qp_next->qp_num) ? "qp_next" :
+                (wc[i].qp_num == ctx->qp_prev->qp_num) ? "qp_prev" : "unknown-qp";
+            fprintf(stderr,
+                    "[rank %d] WC error: %s (status=%d vendor_err=0x%x qp=%u[%s] "
+                    "wr_id=%llu opcode=%d byte_len=%u)\n",
+                    ctx->rank, ibv_wc_status_str(wc[i].status), wc[i].status,
+                    wc[i].vendor_err, wc[i].qp_num, role,
+                    (unsigned long long) wc[i].wr_id, wc[i].opcode, wc[i].byte_len);
+            return -1;
+        }
+
+        if (wc[i].qp_num == ctx->qp_prev->qp_num) {
+            if (wc[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+                (*got_recv)++;
+                rzv_seg_cb(rc, wc[i].wr_id);
+                if (++(*freed_batch) >= RZV_CREDIT_BATCH) {
+                    if (post_credit_return(ctx->qp_prev, (uint32_t) *freed_batch, 0)) {
+                        fprintf(stderr, "[rank %d] post_credit_return failed\n", ctx->rank);
+                        return -1;
+                    }
+                    (*credit_sends_pending)++;
+                    *freed_batch = 0;
+                }
+            } else {
+                (*credit_sends_pending)--;   /* IBV_WC_SEND -- our credit-return to prev completed. */
+            }
+        } else {
+            if (wc[i].opcode == IBV_WC_RECV) {
+                *credits += (int) ntohl(wc[i].imm_data);
+                if (post_dummy_recv(ctx->qp_next, wc[i].wr_id)) {
+                    fprintf(stderr, "[rank %d] credit-recv replenish failed\n", ctx->rank);
+                    return -1;
+                }
+            } else {
+                (*got_send)++;   /* IBV_WC_RDMA_WRITE -- our data write to next completed. */
+            }
+        }
+    }
+    return 0;
+}
+
 static int pg_reduce_scatter_rendezvous(pg_context_t *ctx, const void *sendbuf,
                                          void *recvbuf, int count, DATATYPE dt, OPERATION op)
 {
@@ -718,40 +934,36 @@ static int pg_reduce_scatter_rendezvous(pg_context_t *ctx, const void *sendbuf,
     if (N == 1) return 0;
 
     int max_chunk_elems = (count + N - 1) / N;
-    size_t stage_bytes = (size_t) max_chunk_elems * esz;
-    if (stage_bytes == 0) stage_bytes = esz;
-
-    void *stage = malloc(stage_bytes);
-    if (!stage) { fprintf(stderr, "stage buf alloc failed\n"); return -1; }
-    struct ibv_mr *stage_mr = NULL, *recv_mr = NULL, *send_mr = NULL;
-    int rc = -1;
-
-    stage_mr = ibv_reg_mr(ctx->pd, stage, stage_bytes,
-                          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-    recv_mr = ibv_reg_mr(ctx->pd, recvbuf, (size_t) count * esz,
-                         IBV_ACCESS_LOCAL_WRITE);
-    if (sendbuf == recvbuf) {
-        send_mr = recv_mr;
-    } else {
-        send_mr = ibv_reg_mr(ctx->pd, (void *) sendbuf, (size_t) count * esz,
-                             0);
-    }
-    if (!stage_mr || !recv_mr || !send_mr) {
-        fprintf(stderr, "MR registration failed (reduce_scatter)\n");
-        goto cleanup;
+    if ((size_t) max_chunk_elems * esz > RZV_STAGE_BYTES) {
+        fprintf(stderr, "rank %d: chunk too large for the rendezvous ring buffer "
+                         "(%zu B > %zu B) -- increase RZV_STAGE_BYTES\n",
+                r, (size_t) max_chunk_elems * esz, (size_t) RZV_STAGE_BYTES);
+        return -1;
     }
 
-    struct buf_info my_landing = { .addr = (uint64_t) stage, .rkey = stage_mr->rkey, .size = (uint32_t) stage_bytes };
-    struct buf_info next_landing;
-    if (exchange_landing_info(ctx, &my_landing, &next_landing)) {
-        fprintf(stderr, "landing-info exchange failed (reduce_scatter)\n");
-        goto cleanup;
+    struct ibv_mr *recv_mr = ibv_reg_mr(ctx->pd, recvbuf, (size_t) count * esz, IBV_ACCESS_LOCAL_WRITE);
+    if (!recv_mr) { fprintf(stderr, "recvbuf MR registration failed (reduce_scatter)\n"); return -1; }
+    struct ibv_mr *send_mr = sendbuf == recvbuf
+                           ? recv_mr
+                           : ibv_reg_mr(ctx->pd, (void *) sendbuf, (size_t) count * esz, 0);
+    if (!send_mr) {
+        fprintf(stderr, "sendbuf MR registration failed (reduce_scatter)\n");
+        ibv_dereg_mr(recv_mr);
+        return -1;
     }
 
-    /* nsegs_out captured from the PREVIOUS iteration: gates whether next's
-     * ack (below) is even expected this step -- there's only something to
-     * protect if we actually wrote into next's stage buffer last time. */
-    int prev_nsegs_out = 0;
+    /* Flatten every ring step's segments into two global, order-preserving
+     * lists up front -- this is what removes the old per-step barrier:
+     * once these are built, the sending loop below walks straight through
+     * ALL N-1 steps' segments back to back, gated by nothing but credit
+     * availability, and the receiving side (driven by rzv_poll_once, via
+     * rzv_seg_cb) matches incoming completions against in_segs[] purely by
+     * position -- neither side ever has to ask "which step are we on?" */
+    struct rzv_seg_desc out_segs[RZV_MAX_SEGS_PER_CALL];
+    struct rzv_seg_desc in_segs[RZV_MAX_SEGS_PER_CALL];
+    int out_step_start[MAX_PROCESSES - 1], in_step_start[MAX_PROCESSES - 1];
+    int out_step_count[MAX_PROCESSES - 1], in_step_count[MAX_PROCESSES - 1];
+    int total_out = 0, total_in = 0;
 
     for (int s = 0; s < N - 1; s++) {
         int send_idx = ((r - s) % N + N) % N;
@@ -760,91 +972,160 @@ static int pg_reduce_scatter_rendezvous(pg_context_t *ctx, const void *sendbuf,
         chunk_range(count, N, send_idx, &s_start, &s_len);
         chunk_range(count, N, recv_idx, &r_start, &r_len);
 
-        int nsegs_out = s_len > 0 ? (s_len < PIPE_SEGS ? s_len : PIPE_SEGS) : 0;
-        int nsegs_in  = r_len > 0 ? (r_len < PIPE_SEGS ? r_len : PIPE_SEGS) : 0;
+        int nsegs_out = s_len > 0 ? (s_len < RZV_RING_SEGS ? s_len : RZV_RING_SEGS) : 0;
+        int nsegs_in  = r_len > 0 ? (r_len < RZV_RING_SEGS ? r_len : RZV_RING_SEGS) : 0;
+        out_step_start[s] = total_out;
+        in_step_start[s] = total_in;
+        out_step_count[s] = nsegs_out;
+        in_step_count[s] = nsegs_in;
 
-        /* The stage buffer is a single, reused region (same address every
-         * step). An RDMA-write send-completion only proves the bytes landed
-         * in next's memory -- it says nothing about whether next's CPU has
-         * finished reducing the *previous* step's contents out of
-         * that same buffer yet. Without an explicit ack, a fast sender can
-         * race ahead and overwrite data its peer hasn't consumed.
-         *
-         * Gate this on PREV_NSEGS_OUT (what *this* rank sent last step),
-         * not the current step's count: the ack we're waiting for is next's
-         * confirmation that it drained *that* write, and next only sends
-         * one when it actually received something last step. Getting this
-         * gate wrong desyncs the ack byte-stream against the very next
-         * landing-info exchange (All-Gather's) -- which is exactly what
-         * produced a corrupted remote addr/rkey and the resulting
-         * IBV_WC_REM_ACCESS_ERR / cascading IBV_WC_WR_FLUSH_ERR before. */
-        if (s > 0 && prev_nsegs_out > 0) {
-            char ack;
-            if (recv_all(ctx->sock_next, &ack, 1)) {
-                fprintf(stderr, "reduce_scatter: ack-from-next failed at step %d\n", s);
-                goto cleanup;
-            }
-        }
-
-        /* Pre-post receive placeholders before the peer starts writing. */
-        for (int i = 0; i < nsegs_in; i++) post_dummy_recv(ctx->qp_prev, (uint64_t) i);
-
-        /* Step zero forwards this rank's original chunk from sendbuf.
-         * Later steps forward the partial chunk produced in recvbuf by the
-         * previous step's callback. Post every outbound segment up front:
-         * later sends then overlap reduction of incoming segments. */
         for (int i = 0; i < nsegs_out; i++) {
             int seg_start, seg_len;
             seg_range(s_len, nsegs_out, i, &seg_start, &seg_len);
-            const void *source_buf = s == 0 ? sendbuf : recvbuf;
-            struct ibv_mr *source_mr = s == 0 ? send_mr : recv_mr;
-            uint64_t laddr = (uint64_t) ((const char *) source_buf + (size_t) (s_start + seg_start) * esz);
-            uint64_t raddr = next_landing.addr + (size_t) seg_start * esz;
-            uint32_t wlen  = (uint32_t) (seg_len * esz);
-
-            if (check_bounds(ctx->rank, "reduce_scatter local(send-src)",
-                              laddr, wlen, (uint64_t) source_buf, (uint32_t) (count * esz)) ||
-                check_bounds(ctx->rank, "reduce_scatter remote(next stage)",
-                              raddr, wlen, next_landing.addr, next_landing.size)) {
-                goto cleanup;
-            }
-
-            if (post_write_imm(ctx->qp_next, laddr, source_mr->lkey, wlen,
-                                raddr, next_landing.rkey, (uint32_t) ((s << 8) | i), (uint64_t) i)) {
-                fprintf(stderr, "post_write_imm failed (reduce_scatter step %d)\n", s);
-                goto cleanup;
-            }
+            out_segs[total_out].offset = s_start + seg_start;
+            out_segs[total_out].len    = seg_len;
+            out_segs[total_out].from_sendbuf = (s == 0);
+            total_out++;
         }
-
-        struct rs_ctx rc = { .sendbuf = sendbuf, .recvbuf = recvbuf, .dt = dt, .op = op, .stage = stage,
-                              .chunk_start_elems = r_start, .nsegs = nsegs_in, .chunk_len = r_len };
-        if (drain_step(ctx, nsegs_out, nsegs_in, rs_seg_cb, &rc)) goto cleanup;
-
-        /* I've now reduced every segment prev wrote into my
-         * stage buffer this step -- tell prev it may safely reuse that same
-         * buffer for step s+1's writes. Skip on the LAST step: there is no
-         * step N-1, so nobody will ever wait for this one -- sending it
-         * anyway is exactly the extra, unconsumed byte that caused the
-         * desync described above. */
-        if (s < N - 2 && nsegs_in > 0) {
-            char ack = 1;
-            if (send_all(ctx->sock_prev, &ack, 1)) {
-                fprintf(stderr, "reduce_scatter: ack-to-prev failed at step %d\n", s);
-                goto cleanup;
-            }
+        for (int i = 0; i < nsegs_in; i++) {
+            int seg_start, seg_len;
+            seg_range(r_len, nsegs_in, i, &seg_start, &seg_len);
+            in_segs[total_in].offset = r_start + seg_start;
+            in_segs[total_in].len    = seg_len;
+            in_segs[total_in].produces_out = -1;
+            total_in++;
         }
-
-        prev_nsegs_out = nsegs_out;
     }
 
-    rc = 0;
+    /* A segment sent in step s+1 is the partial reduction received in step
+     * s. Record that dependency explicitly: ring credits protect staging
+     * slots from reuse, but do not mean the CPU has reduced a segment yet. */
+    for (int s = 0; s < N - 2; s++) {
+        if (in_step_count[s] != out_step_count[s + 1]) {
+            fprintf(stderr, "[rank %d] reduce-scatter segment mapping mismatch at step %d\n", r, s);
+            ibv_dereg_mr(recv_mr);
+            if (send_mr != recv_mr) ibv_dereg_mr(send_mr);
+            return -1;
+        }
+        for (int i = 0; i < in_step_count[s]; i++) {
+            int in_idx = in_step_start[s] + i;
+            int out_idx = out_step_start[s + 1] + i;
+            if (in_segs[in_idx].offset != out_segs[out_idx].offset ||
+                in_segs[in_idx].len != out_segs[out_idx].len) {
+                fprintf(stderr, "[rank %d] reduce-scatter segment mismatch at step %d, segment %d\n",
+                        r, s, i);
+                ibv_dereg_mr(recv_mr);
+                if (send_mr != recv_mr) ibv_dereg_mr(send_mr);
+                return -1;
+            }
+            in_segs[in_idx].produces_out = out_idx;
+        }
+    }
 
-cleanup:
-    if (send_mr && send_mr != recv_mr) ibv_dereg_mr(send_mr);
-    if (recv_mr) ibv_dereg_mr(recv_mr);
-    if (stage_mr) ibv_dereg_mr(stage_mr);
-    free(stage);
-    return rc;
+    /* Pre-post every incoming segment's dummy receive placeholder up front,
+     * for the WHOLE call (bounded by RZV_MAX_SEGS_PER_CALL <= RQ_DEPTH, so
+     * this always fits in one shot) -- prev's writes can then land the
+     * instant credits allow it to send them, with no per-step re-posting
+     * gating how far ahead of us it's allowed to get. */
+    for (int i = 0; i < total_in; i++) {
+        if (post_dummy_recv(ctx->qp_prev, (uint64_t) i)) {
+            fprintf(stderr, "[rank %d] data-recv pre-post failed\n", ctx->rank);
+            ibv_dereg_mr(recv_mr);
+            if (send_mr != recv_mr) ibv_dereg_mr(send_mr);
+            return -1;
+        }
+    }
+
+    int out_ready[RZV_MAX_SEGS_PER_CALL] = { 0 };
+    struct rzv_rs_ctx rc = { .ctx = ctx, .sendbuf = sendbuf, .recvbuf = recvbuf,
+                              .dt = dt, .op = op, .in_segs = in_segs,
+                              .out_ready = out_ready };
+
+    int credits     = RZV_RING_SEGS; /* next's ring buffer starts fully free */
+    int freed_batch = 0;             /* segments reduced but not yet credited back to prev */
+    int got_send = 0, got_recv = 0;
+    int credit_sends_pending = 0;    /* our own credit-return SENDs to prev not yet completed */
+
+    /* The continuous pipeline walks every outgoing segment of the ENTIRE
+     * call. A segment can be sent only after its prior-step reduction is
+     * ready and a credit is available. While waiting, rzv_poll_once() makes progress on what's
+     * actually ready: incoming segments from prev (reduced immediately,
+     * feeding freed_batch/credit-returns to prev) and credit-returns from
+     * next (feeding credits right back into this same loop). This is what
+     * lets step s+1's sends overlap step s's still-in-flight receives --
+     * nothing here ever waits for "this step" to finish before starting
+     * the next one. */
+    for (int k = 0; k < total_out; k++) {
+        while (credits == 0 ||
+               (!out_segs[k].from_sendbuf && !out_ready[k])) {
+            if (rzv_poll_once(ctx, &rc, &got_send, &got_recv, &credits, &freed_batch,
+                               &credit_sends_pending)) return -1;
+        }
+
+        uint64_t slot  = (uint64_t) k % RZV_RING_SEGS;
+        const void *source_buf = out_segs[k].from_sendbuf ? sendbuf : recvbuf;
+        struct ibv_mr *source_mr = out_segs[k].from_sendbuf ? send_mr : recv_mr;
+        uint64_t laddr = (uint64_t) ((const char *) source_buf + (size_t) out_segs[k].offset * esz);
+        uint64_t raddr = ctx->remote_rzv_stage.addr + slot * RZV_SEG_BYTES;
+        uint32_t wlen  = (uint32_t) (out_segs[k].len * esz);
+
+        if (wlen > RZV_SEG_BYTES) {
+            fprintf(stderr, "[rank %d] segment (%u B) exceeds ring slot capacity (%zu B)\n",
+                    ctx->rank, wlen, (size_t) RZV_SEG_BYTES);
+            return -1;
+        }
+        if (check_bounds(ctx->rank, "reduce_scatter local(send-src)",
+                          laddr, wlen, (uint64_t) source_buf, (uint32_t) (count * esz)) ||
+            check_bounds(ctx->rank, "reduce_scatter remote(next ring slot)",
+                          raddr, wlen, ctx->remote_rzv_stage.addr, ctx->remote_rzv_stage.size)) {
+            return -1;
+        }
+
+        if (post_write_imm(ctx->qp_next, laddr, source_mr->lkey, wlen,
+                            raddr, ctx->remote_rzv_stage.rkey, (uint32_t) k, (uint64_t) k)) {
+            fprintf(stderr, "post_write_imm failed (reduce_scatter segment %d)\n", k);
+            return -1;
+        }
+        credits--;
+    }
+
+    /* All sends posted; finish draining every data completion in both
+     * directions for the whole call (credit traffic keeps being handled
+     * inline by rzv_poll_once() as it arrives). */
+    while (got_send < total_out || got_recv < total_in) {
+        if (rzv_poll_once(ctx, &rc, &got_send, &got_recv, &credits, &freed_batch,
+                           &credit_sends_pending)) return -1;
+    }
+
+    /* Tail handling: flush any processed-but-not-yet-credited segments so
+     * prev isn't left permanently short the credits it needs to use this
+     * same ring buffer again on its next call. */
+    if (freed_batch > 0) {
+        if (post_credit_return(ctx->qp_prev, (uint32_t) freed_batch, 0)) {
+            fprintf(stderr, "[rank %d] final credit-return flush failed\n", ctx->rank);
+            return -1;
+        }
+        credit_sends_pending++;
+        freed_batch = 0;
+    }
+
+    /* Drain until every credit we handed out this call has come back (so
+     * the NEXT pg_all_reduce() call starts from a fully-credited ring
+     * buffer) AND every credit-return SEND we ourselves posted has
+     * actually completed. The latter matters because this QP/CQ pair is
+     * shared with pg_all_gather_rendezvous right after we return: its
+     * drain_step() has no notion of credit traffic and would misinterpret
+     * any leftover completion on qp_prev as incoming all-gather data,
+     * desyncing that phase. No more real data is expected at this point --
+     * only credit-return traffic in both directions. */
+    while (credits < RZV_RING_SEGS || credit_sends_pending > 0) {
+        if (rzv_poll_once(ctx, &rc, &got_send, &got_recv, &credits, &freed_batch,
+                           &credit_sends_pending)) return -1;
+    }
+
+    if (send_mr != recv_mr) ibv_dereg_mr(send_mr);
+    ibv_dereg_mr(recv_mr);
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -978,8 +1259,9 @@ static int post_recv_into(struct ibv_qp *qp, uint64_t laddr, uint32_t lkey,
     return ibv_post_recv(qp, &wr, &bad);
 }
 
-/* Registration cache keyed on pointer identity: repeated collectives over
- * the same result buffer should only pay ibv_reg_mr() once. */
+/* Registration cache keyed on pointer identity: a benchmark loop or a
+ * training loop calling pg_all_reduce() on the SAME sendbuf/recvbuf every
+ * iteration should only pay ibv_reg_mr() once, not once per call. */
 static struct ibv_mr *get_cached_mr(pg_context_t *ctx, void *buf, size_t bytes)
 {
     if (ctx->eager_mr && ctx->eager_mr_ptr == buf && ctx->eager_mr_size >= bytes)
@@ -1133,11 +1415,9 @@ static int pg_all_gather_eager(pg_context_t *ctx, void *recvbuf, int count, DATA
 }
 
 /* ------------------------------------------------------------------ */
-/* pg_all_reduce: out-of-place input/output, no full-vector memcpy.     */
+/* pg_all_reduce: separate input/output buffers, no full-vector memcpy. */
 /* ------------------------------------------------------------------ */
 
-/* Input and output may be separate or aliased. Reduce-Scatter seeds each
- * output chunk from the local input plus the arriving partial reduction. */
 static int pg_all_reduce_rendezvous(pg_context_t *ctx, const void *sendbuf, void *recvbuf,
                                      int count, DATATYPE dt, OPERATION op)
 {
@@ -1314,6 +1594,9 @@ int pg_close(void *pg_handle)
     if (ctx->eager_send_mr && ibv_dereg_mr(ctx->eager_send_mr))  { fprintf(stderr, "dereg eager_send_mr failed\n"); rc = -1; }
     if (ctx->eager_stage_mr && ibv_dereg_mr(ctx->eager_stage_mr)) { fprintf(stderr, "dereg eager_stage_mr failed\n"); rc = -1; }
     free(ctx->eager_stage);
+
+    if (ctx->rzv_stage_mr && ibv_dereg_mr(ctx->rzv_stage_mr)) { fprintf(stderr, "dereg rzv_stage_mr failed\n"); rc = -1; }
+    free(ctx->rzv_stage);
 
     if (ctx->qp_next && ibv_destroy_qp(ctx->qp_next)) { fprintf(stderr, "destroy qp_next failed\n"); rc = -1; }
     if (ctx->qp_prev && ibv_destroy_qp(ctx->qp_prev)) { fprintf(stderr, "destroy qp_prev failed\n"); rc = -1; }
