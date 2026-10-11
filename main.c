@@ -151,6 +151,31 @@ typedef struct {
     struct ibv_mr   *rzv_stage_mr;
     struct buf_info  remote_rzv_stage;    /* next rank's ring buffer: addr/rkey/size to RDMA-Write into */
 
+    /* --- All-Gather Rendezvous: MR cache + in-band RDMA metadata exchange
+     * (replaces per-call ibv_reg_mr + TCP exchange_landing_info). --- */
+    void             *ag_cached_ptr;    /* recvbuf pointer the cache below is valid for */
+    size_t            ag_cached_size;   /* and the byte size it was registered at       */
+    struct ibv_mr    *ag_local_mr;      /* MR for ag_cached_ptr, kept across calls       */
+    struct buf_info   ag_remote_info;   /* next's CURRENT recvbuf addr/rkey/size, kept
+                                          * fresh via RDMA announcements from next        */
+
+    struct buf_info  *meta_send_buf;    /* staging: my own recvbuf's current info,
+                                          * RDMA-Written OUT to prev on a cache miss      */
+    struct buf_info  *meta_recv_buf;    /* landing: next's announcement arrives here
+                                          * (next RDMA-Writes INTO it)                    */
+    struct ibv_mr    *meta_send_mr;
+    struct ibv_mr    *meta_recv_mr;
+    struct buf_info   remote_meta_prev; /* prev's meta_recv_buf addr/rkey -- learned ONCE
+                                          * at connect time via a REVERSED TCP exchange
+                                          * (send on sock_next, recv on sock_prev, instead
+                                          * of exchange_landing_info()'s usual direction):
+                                          * the all-gather DATA flow writes into next, same
+                                          * as reduce-scatter, but its per-call metadata
+                                          * announcement flows the OTHER way -- every rank
+                                          * announces its own recvbuf to its PREV, so prev
+                                          * can write all-gather data into it -- so what's
+                                          * needed here is prev's meta_recv_buf, not next's. */
+
     /* MR cache for a stable output buffer reused across collectives. */
     void          *eager_mr_ptr;
     size_t         eager_mr_size;
@@ -721,14 +746,57 @@ int connect_process_group(char *servername, void **pg_handle)
         return -1;
     }
 
+    /* All-Gather Rendezvous: MR cache + in-band RDMA metadata exchange.
+     * meta_send_buf/meta_recv_buf are allocated and registered exactly once,
+     * here, for the process group's lifetime -- this is what lets
+     * pg_all_gather_rendezvous() skip both ibv_reg_mr() and the TCP
+     * landing-info round trip on every call, paying them only when the
+     * caller's recvbuf pointer/size actually changes. */
+    ctx->meta_send_buf = malloc(sizeof *ctx->meta_send_buf);
+    ctx->meta_recv_buf = malloc(sizeof *ctx->meta_recv_buf);
+    if (!ctx->meta_send_buf || !ctx->meta_recv_buf) {
+        fprintf(stderr, "rank %d: meta buffer alloc failed\n", rank);
+        return -1;
+    }
+    ctx->meta_send_mr = ibv_reg_mr(ctx->pd, ctx->meta_send_buf, sizeof *ctx->meta_send_buf,
+                                    IBV_ACCESS_LOCAL_WRITE);
+    ctx->meta_recv_mr = ibv_reg_mr(ctx->pd, ctx->meta_recv_buf, sizeof *ctx->meta_recv_buf,
+                                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    if (!ctx->meta_send_mr || !ctx->meta_recv_mr) {
+        fprintf(stderr, "rank %d: meta buffer MR reg failed\n", rank);
+        return -1;
+    }
+
+    /* Learn PREV's meta_recv_buf address/rkey -- the one thing the all-gather
+     * phase still needs from TCP, paid exactly once, here, never again per
+     * call. This is a REVERSED exchange relative to exchange_landing_info()
+     * (which always tells you about NEXT): sending on sock_next / receiving
+     * on sock_prev (instead of the usual prev/next) delivers prev's
+     * meta_recv_buf info instead -- see the field comment on
+     * remote_meta_prev for why that's the direction actually needed here. */
+    struct buf_info my_meta_landing = { .addr = (uint64_t) ctx->meta_recv_buf,
+                                         .rkey = ctx->meta_recv_mr->rkey,
+                                         .size = (uint32_t) sizeof *ctx->meta_recv_buf };
+    if (send_all(ctx->sock_next, &my_meta_landing, sizeof my_meta_landing) ||
+        recv_all(ctx->sock_prev, &ctx->remote_meta_prev, sizeof ctx->remote_meta_prev)) {
+        fprintf(stderr, "rank %d: meta_recv_buf landing-info exchange failed\n", rank);
+        return -1;
+    }
+
     /* Pre-post dummy (zero-SGE) receives on qp_next to catch incoming
      * credit-return messages from next (0-byte IBV_WR_SEND_WITH_IMM) --
-     * required so next's credit sends never hit an RNR on us. qp_next's
+     * required so next's credit sends never hit an RNR on us. The SAME pool
+     * also catches next's all-gather metadata announcements (one-sided
+     * IBV_WR_RDMA_WRITE_WITH_IMM): since a one-sided write delivers its
+     * payload to the address named IN the write itself, the matched recv WR
+     * never needs a real buffer regardless of which kind of signal it's
+     * catching -- a dummy recv works for both, opcode is what tells them
+     * apart on arrival (see ag_poll_once()/rzv_poll_once()). qp_next's
      * receive queue is otherwise unused (Eager only ever posts its
      * two-sided recvs on qp_prev), so these RQ_DEPTH placeholders are
-     * dedicated entirely to credit traffic and kept topped up for the
-     * process group's lifetime: every time pg_reduce_scatter_rendezvous()
-     * consumes one, it posts a replacement immediately. */
+     * dedicated entirely to this traffic and kept topped up for the
+     * process group's lifetime: every time credit or metadata traffic
+     * consumes one, a replacement is posted immediately. */
     for (int i = 0; i < RQ_DEPTH; i++) {
         if (post_dummy_recv(ctx->qp_next, (uint64_t) i)) {
             fprintf(stderr, "rank %d: initial credit-recv pre-post failed\n", rank);
@@ -1132,7 +1200,101 @@ static int pg_reduce_scatter_rendezvous(pg_context_t *ctx, const void *sendbuf,
 /* All-Gather: zero-copy. Every segment is RDMA-Written straight from   */
 /* the sender's recvbuf chunk into the SAME byte offset of the peer's   */
 /* recvbuf -- no staging buffer, no memcpy on either side.              */
+/*                                                                      */
+/* MR + landing-info are now cached across calls (ctx->ag_local_mr /    */
+/* ctx->ag_remote_info): ibv_reg_mr() and the metadata exchange only    */
+/* happen when the caller's (recvbuf, size) actually changes from the   */
+/* previous call -- the common case (a benchmark/training loop reusing  */
+/* the same buffer) pays neither cost again. On a cache miss, the       */
+/* metadata exchange itself is pure RDMA, not TCP: each rank announces  */
+/* its own recvbuf by RDMA-Writing it into its PREV's meta_recv_buf (see*/
+/* remote_meta_prev's comment for why that's "prev" and not "next"),    */
+/* and learns its NEXT's current recvbuf the same way, in reverse, via  */
+/* its own meta_recv_buf. TCP is used only once, ever, in               */
+/* connect_process_group(), to learn the META_RECV_BUF *addresses*      */
+/* themselves -- never again per call, and never for the recvbuf data.  */
 /* ------------------------------------------------------------------ */
+
+/* Polls the CQ once for all_gather's traffic mix and dispatches by
+ * (qp_num, opcode):
+ *   qp_prev + RECV_RDMA_WITH_IMM -> an all-gather DATA segment landed
+ *                                   (zero-copy replace, no callback needed):
+ *                                   (*got_recv)++.
+ *   qp_prev + RDMA_WRITE         -> our own metadata-announcement write (the
+ *                                   one-sided write pg_all_gather_rendezvous()
+ *                                   posts to prev's meta_recv_buf on a cache
+ *                                   miss) completed locally: (*got_send)++.
+ *   qp_prev + else (SEND)        -> a stray credit-return-send completion
+ *                                   left over from reduce-scatter; drained
+ *                                   defensively, nothing to do.
+ *   qp_next + RDMA_WRITE         -> our own all-gather data write to next
+ *                                   completed: (*got_send)++.
+ *   qp_next + RECV_RDMA_WITH_IMM -> next's metadata announcement arrived in
+ *                                   our meta_recv_buf: copy it into
+ *                                   ctx->ag_remote_info, set *meta_arrived,
+ *                                   and replenish the consumed dummy recv
+ *                                   (same pool credit-returns use -- see
+ *                                   connect_process_group()).
+ *   qp_next + RECV                -> a stray credit-return (e.g. a slightly
+ *                                   behind neighbour still finishing
+ *                                   reduce-scatter); drained and the dummy
+ *                                   recv replenished so it never RNRs, but
+ *                                   the freed count itself is discarded --
+ *                                   this phase has no credits counter to
+ *                                   apply it to.
+ * Note *got_send is shared between the qp_prev (metadata) and qp_next (data)
+ * cases: this is safe because a given call site only ever has ONE of those
+ * two things outstanding against it at a time -- the metadata-wait loop runs
+ * before any data WR is posted, and by the time the data loop starts this
+ * call's own metadata-announcement completion has already been consumed. */
+static int ag_poll_once(pg_context_t *ctx, int *got_send, int *got_recv, int *meta_arrived)
+{
+    struct ibv_wc wc[WC_BATCH];
+    int ne = ibv_poll_cq(ctx->cq, WC_BATCH, wc);
+    if (ne < 0) { fprintf(stderr, "poll_cq failed\n"); return -1; }
+
+    for (int i = 0; i < ne; i++) {
+        if (wc[i].status != IBV_WC_SUCCESS) {
+            const char *role =
+                (wc[i].qp_num == ctx->qp_next->qp_num) ? "qp_next" :
+                (wc[i].qp_num == ctx->qp_prev->qp_num) ? "qp_prev" : "unknown-qp";
+            fprintf(stderr,
+                    "[rank %d] WC error: %s (status=%d vendor_err=0x%x qp=%u[%s] "
+                    "wr_id=%llu opcode=%d byte_len=%u)\n",
+                    ctx->rank, ibv_wc_status_str(wc[i].status), wc[i].status,
+                    wc[i].vendor_err, wc[i].qp_num, role,
+                    (unsigned long long) wc[i].wr_id, wc[i].opcode, wc[i].byte_len);
+            return -1;
+        }
+
+        if (wc[i].qp_num == ctx->qp_prev->qp_num) {
+            if (wc[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+                (*got_recv)++;
+            }else if (wc[i].opcode == IBV_WC_RDMA_WRITE) {
+                /* השלמת שליחת המטא-דאטה אל השכן הקודם בעת פספוס במטמון */
+                (*got_send)++;
+            }
+            /* else: IBV_WC_SEND -- stray credit-return-send completion; nothing to do. */
+        } else {
+            if (wc[i].opcode == IBV_WC_RDMA_WRITE) {
+                (*got_send)++;
+            } else if (wc[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+                ctx->ag_remote_info = *ctx->meta_recv_buf;
+                *meta_arrived = 1;
+                if (post_dummy_recv(ctx->qp_next, wc[i].wr_id)) {
+                    fprintf(stderr, "[rank %d] metadata-recv replenish failed\n", ctx->rank);
+                    return -1;
+                }
+            } else if (wc[i].opcode == IBV_WC_RECV) {
+                if (post_dummy_recv(ctx->qp_next, wc[i].wr_id)) {
+                    fprintf(stderr, "[rank %d] credit-recv replenish failed\n", ctx->rank);
+                    return -1;
+                }
+            }
+        }
+    }
+    return 0;
+}
 
 static int pg_all_gather_rendezvous(pg_context_t *ctx, void *recvbuf, int count, DATATYPE dt)
 {
@@ -1140,17 +1302,64 @@ static int pg_all_gather_rendezvous(pg_context_t *ctx, void *recvbuf, int count,
     size_t esz = dt_size(dt);
     if (N == 1) return 0;
 
-    struct ibv_mr *recv_mr = ibv_reg_mr(ctx->pd, recvbuf, (size_t) count * esz,
-                                        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-    if (!recv_mr) { fprintf(stderr, "recvbuf MR registration failed (all_gather)\n"); return -1; }
+    size_t bytes = (size_t) count * esz;
+    int meta_send_pending = 0;
 
-    struct buf_info my_landing = { .addr = (uint64_t) recvbuf, .rkey = recv_mr->rkey,
-                                    .size = (uint32_t) (count * esz) };
-    struct buf_info next_landing;
-    if (exchange_landing_info(ctx, &my_landing, &next_landing)) {
-        fprintf(stderr, "landing-info exchange failed (all_gather)\n");
-        return -1;
+    if (ctx->ag_cached_ptr != recvbuf || ctx->ag_cached_size != bytes) {
+        /* Cache miss: (re)register recvbuf and refresh the metadata both
+         * neighbours hold about it, entirely over RDMA. */
+        if (ctx->ag_local_mr) ibv_dereg_mr(ctx->ag_local_mr);
+        ctx->ag_local_mr = ibv_reg_mr(ctx->pd, recvbuf, bytes,
+                                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!ctx->ag_local_mr) {
+            fprintf(stderr, "recvbuf MR registration failed (all_gather)\n");
+            ctx->ag_cached_ptr = NULL;
+            return -1;
+        }
+        ctx->ag_cached_ptr  = recvbuf;
+        ctx->ag_cached_size = bytes;
+
+        *ctx->meta_send_buf = (struct buf_info) { .addr = (uint64_t) recvbuf,
+                                                    .rkey = ctx->ag_local_mr->rkey,
+                                                    .size = (uint32_t) bytes };
+
+        /* Announce myself to prev (one-sided RDMA Write, not TCP) -- prev's
+         * matching recv is any already-pre-posted dummy on its qp_next
+         * (see connect_process_group()), so no coordination is needed on
+         * prev's end beyond having learned my meta_recv_buf once, at
+         * connect time. */
+        if (post_write_imm(ctx->qp_prev, (uint64_t) ctx->meta_send_buf, ctx->meta_send_mr->lkey,
+                            (uint32_t) sizeof *ctx->meta_send_buf,
+                            ctx->remote_meta_prev.addr, ctx->remote_meta_prev.rkey,
+                            0, 0)) {
+            fprintf(stderr, "[rank %d] metadata announcement failed (all_gather)\n", ctx->rank);
+            return -1;
+        }
+        meta_send_pending = 1;
+
+        /* Wait until next's reciprocal announcement has landed in our own
+         * meta_recv_buf (refreshing ctx->ag_remote_info) AND our own
+         * announcement-write above has completed locally -- both must be
+         * done before any data WR below can safely reference the SOURCE/
+         * TARGET MRs this exchange just updated. */
+        int dummy_send = 0, dummy_recv = 0, meta_arrived = 0;
+        while (!meta_arrived || meta_send_pending) {
+            if (ag_poll_once(ctx, &dummy_send, &dummy_recv, &meta_arrived)) return -1;
+            /* ag_poll_once() doesn't know about meta_send_pending (it isn't
+             * meaningful outside this cache-miss path), so it's tracked
+             * here: any qp_prev + IBV_WC_RDMA_WRITE completion while we're
+             * in this loop (dummy_send, i.e. ag_poll_once()'s *got_send for
+             * the qp_prev branch) can only be our own announcement-write
+             * completing locally -- that's the only thing this rank ever
+             * posts on qp_prev as an RDMA_WRITE (credit-returns there are a
+             * different opcode, IBV_WC_SEND, and ignored), and the data
+             * loop below (which posts on qp_next) hasn't started yet. */
+            if (dummy_send) { meta_send_pending = 0; dummy_send = 0; }
+        }
     }
+
+    struct ibv_mr *recv_mr = ctx->ag_local_mr;
+    struct buf_info next_landing = ctx->ag_remote_info;
 
     for (int s = 0; s < N - 1; s++) {
         int send_idx = ((r - s + 1) % N + N) % N;
@@ -1174,7 +1383,7 @@ static int pg_all_gather_rendezvous(pg_context_t *ctx, void *recvbuf, int count,
             uint32_t wlen  = (uint32_t) (seg_len * esz);
 
             if (check_bounds(ctx->rank, "all_gather local(send-src)",
-                              laddr, wlen, (uint64_t) recvbuf, (uint32_t) (count * esz)) ||
+                              laddr, wlen, (uint64_t) recvbuf, (uint32_t) bytes) ||
                 check_bounds(ctx->rank, "all_gather remote(next recvbuf)",
                               raddr, wlen, next_landing.addr, next_landing.size)) {
                 return -1;
@@ -1188,11 +1397,19 @@ static int pg_all_gather_rendezvous(pg_context_t *ctx, void *recvbuf, int count,
         }
 
         /* No callback needed: the RDMA Write already deposited the final
-         * bytes; the completion is purely a delivery signal. */
-        if (drain_step(ctx, nsegs_out, nsegs_in, NULL, NULL)) return -1;
+         * bytes; the completion is purely a delivery signal. A stray
+         * metadata-announcement or credit-return arriving mid-step (from a
+         * neighbour starting its own cache-miss exchange early) is handled
+         * inline by ag_poll_once() without disturbing got_send/got_recv. */
+        int got_send = 0, got_recv = 0, dummy_meta = 0;
+        while (got_send < nsegs_out || got_recv < nsegs_in) {
+            if (ag_poll_once(ctx, &got_send, &got_recv, &dummy_meta)) return -1;
+        }
     }
 
-    ibv_dereg_mr(recv_mr);
+    /* ag_local_mr is NOT deregistered here -- it persists in the cache for
+     * the next call to reuse, exactly like rzv_stage_mr/eager_stage_mr.
+     * pg_close() owns its final cleanup. */
     return 0;
 }
 
@@ -1597,6 +1814,12 @@ int pg_close(void *pg_handle)
 
     if (ctx->rzv_stage_mr && ibv_dereg_mr(ctx->rzv_stage_mr)) { fprintf(stderr, "dereg rzv_stage_mr failed\n"); rc = -1; }
     free(ctx->rzv_stage);
+
+    if (ctx->ag_local_mr && ibv_dereg_mr(ctx->ag_local_mr))     { fprintf(stderr, "dereg ag_local_mr failed\n"); rc = -1; }
+    if (ctx->meta_send_mr && ibv_dereg_mr(ctx->meta_send_mr))   { fprintf(stderr, "dereg meta_send_mr failed\n"); rc = -1; }
+    if (ctx->meta_recv_mr && ibv_dereg_mr(ctx->meta_recv_mr))   { fprintf(stderr, "dereg meta_recv_mr failed\n"); rc = -1; }
+    free(ctx->meta_send_buf);
+    free(ctx->meta_recv_buf);
 
     if (ctx->qp_next && ibv_destroy_qp(ctx->qp_next)) { fprintf(stderr, "destroy qp_next failed\n"); rc = -1; }
     if (ctx->qp_prev && ibv_destroy_qp(ctx->qp_prev)) { fprintf(stderr, "destroy qp_prev failed\n"); rc = -1; }
