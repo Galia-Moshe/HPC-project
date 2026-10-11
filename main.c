@@ -10,6 +10,9 @@
  *   int connect_process_group(char *servername, void **pg_handle);
  *   int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
  *                      DATATYPE datatype, OPERATION op, void *pg_handle);
+ *   sendbuf is this rank's input; recvbuf receives the reduced result.
+ *   They may be the same pointer or separate, non-overlapping buffers.
+ *   The implementation does not copy the full vector.
  *   int pg_close(void *pg_handle);
  *
  * CLI:
@@ -124,12 +127,16 @@ typedef struct {
     struct ibv_mr *eager_stage_mr;
     size_t         eager_stage_bytes;
 
-    /* Small cache so repeated calls with the SAME sendbuf/recvbuf (the
-     * common case: a training loop reusing its gradient buffers) don't pay
-     * ibv_reg_mr() on every single call. */
+    /* MR caches for stable output/input buffers reused across collectives. */
     void          *eager_mr_ptr;
     size_t         eager_mr_size;
     struct ibv_mr *eager_mr;
+
+    /* Separate cache for the immutable All-Reduce input when sendbuf and
+     * recvbuf are distinct. */
+    void          *eager_send_mr_ptr;
+    size_t         eager_send_mr_size;
+    struct ibv_mr *eager_send_mr;
 
     /* Router threshold: pg_all_reduce() sends messages smaller than this
      * (in bytes) via the Eager path, and this-or-larger via Rendezvous.
@@ -178,42 +185,50 @@ static size_t dt_size(DATATYPE dt)
 #define OP_MIN_F(a, b)  ((a) < (b) ? (a) : (b))
 #define OP_PROD_F(a, b) ((a) * (b))
 
-#define REDUCE_LOOP(T, EXPR) do {                              \
-        T *d = (T *) dst;                                      \
-        const T *s = (const T *) src;                          \
-        for (int _i = 0; _i < n; _i++) d[_i] = EXPR(d[_i], s[_i]); \
+#define REDUCE_SEED_LOOP(T, EXPR) do {                              \
+        T *d = (T *) dst;                                           \
+        const T *local = (const T *) local_src;                     \
+        const T *incoming = (const T *) incoming_src;               \
+        for (int _i = 0; _i < n; _i++)                              \
+            d[_i] = EXPR(local[_i], incoming[_i]);                  \
     } while (0)
 
-/* dst[i] = dst[i] OP src[i], for n elements of type dt. Applied by the
- * CPU as each pipelined segment lands during the Reduce-Scatter phase. */
-static void reduce_apply(void *dst, const void *src, int n, DATATYPE dt, OPERATION op)
+/* Seed a newly received chunk without copying the local input first:
+ * dst[i] = local_src[i] OP incoming_src[i]. */
+static void reduce_seed(void *dst, const void *local_src, const void *incoming_src,
+                        int n, DATATYPE dt, OPERATION op)
 {
     switch (dt) {
     case DT_INT32:
         switch (op) {
-        case OP_SUM:  REDUCE_LOOP(int32_t, OP_SUM_F);  break;
-        case OP_MAX:  REDUCE_LOOP(int32_t, OP_MAX_F);  break;
-        case OP_MIN:  REDUCE_LOOP(int32_t, OP_MIN_F);  break;
-        case OP_PROD: REDUCE_LOOP(int32_t, OP_PROD_F); break;
+        case OP_SUM:  REDUCE_SEED_LOOP(int32_t, OP_SUM_F);  break;
+        case OP_MAX:  REDUCE_SEED_LOOP(int32_t, OP_MAX_F);  break;
+        case OP_MIN:  REDUCE_SEED_LOOP(int32_t, OP_MIN_F);  break;
+        case OP_PROD: REDUCE_SEED_LOOP(int32_t, OP_PROD_F); break;
         }
         break;
     case DT_FLOAT:
         switch (op) {
-        case OP_SUM:  REDUCE_LOOP(float, OP_SUM_F);  break;
-        case OP_MAX:  REDUCE_LOOP(float, OP_MAX_F);  break;
-        case OP_MIN:  REDUCE_LOOP(float, OP_MIN_F);  break;
-        case OP_PROD: REDUCE_LOOP(float, OP_PROD_F); break;
+        case OP_SUM:  REDUCE_SEED_LOOP(float, OP_SUM_F);  break;
+        case OP_MAX:  REDUCE_SEED_LOOP(float, OP_MAX_F);  break;
+        case OP_MIN:  REDUCE_SEED_LOOP(float, OP_MIN_F);  break;
+        case OP_PROD: REDUCE_SEED_LOOP(float, OP_PROD_F); break;
         }
         break;
     case DT_DOUBLE:
         switch (op) {
-        case OP_SUM:  REDUCE_LOOP(double, OP_SUM_F);  break;
-        case OP_MAX:  REDUCE_LOOP(double, OP_MAX_F);  break;
-        case OP_MIN:  REDUCE_LOOP(double, OP_MIN_F);  break;
-        case OP_PROD: REDUCE_LOOP(double, OP_PROD_F); break;
+        case OP_SUM:  REDUCE_SEED_LOOP(double, OP_SUM_F);  break;
+        case OP_MAX:  REDUCE_SEED_LOOP(double, OP_MAX_F);  break;
+        case OP_MIN:  REDUCE_SEED_LOOP(double, OP_MIN_F);  break;
+        case OP_PROD: REDUCE_SEED_LOOP(double, OP_PROD_F); break;
         }
         break;
     }
+}
+
+static int is_valid_operation(OPERATION op)
+{
+    return op == OP_SUM || op == OP_MAX || op == OP_MIN || op == OP_PROD;
 }
 
 /* ------------------------------------------------------------------ */
@@ -666,12 +681,12 @@ int connect_process_group(char *servername, void **pg_handle)
 }
 
 /* ------------------------------------------------------------------ */
-/* Reduce-Scatter: pipelined, CPU reduces into recvbuf as each segment  */
-/* lands (staging buffer, not zero-copy -- reduction needs a landing    */
-/* zone the CPU can add from without racing the caller's recvbuf).      */
+/* Reduce-Scatter: pipelined. Incoming segments land in stage; the CPU  */
+/* combines each with this rank's sendbuf contribution into recvbuf.    */
 /* ------------------------------------------------------------------ */
 
 struct rs_ctx {
+    const void *sendbuf;
     void      *recvbuf;
     DATATYPE   dt;
     OPERATION  op;
@@ -688,12 +703,15 @@ static void rs_seg_cb(void *user, uint64_t wr_id)
     int seg_start, seg_len;
     seg_range(rc->chunk_len, rc->nsegs, seg_i, &seg_start, &seg_len);
     size_t esz = dt_size(rc->dt);
-    void *dst = (char *) rc->recvbuf + (size_t) (rc->chunk_start_elems + seg_start) * esz;
-    void *src = (char *) rc->stage + (size_t) seg_start * esz;
-    reduce_apply(dst, src, seg_len, rc->dt, rc->op);
+    size_t elem_offset = (size_t) (rc->chunk_start_elems + seg_start) * esz;
+    void *dst = (char *) rc->recvbuf + elem_offset;
+    const void *local = (const char *) rc->sendbuf + elem_offset;
+    const void *incoming = (const char *) rc->stage + (size_t) seg_start * esz;
+    reduce_seed(dst, local, incoming, seg_len, rc->dt, rc->op);
 }
 
-static int pg_reduce_scatter_rendezvous(pg_context_t *ctx, void *recvbuf, int count, DATATYPE dt, OPERATION op)
+static int pg_reduce_scatter_rendezvous(pg_context_t *ctx, const void *sendbuf,
+                                         void *recvbuf, int count, DATATYPE dt, OPERATION op)
 {
     int N = ctx->world_size, r = ctx->rank;
     size_t esz = dt_size(dt);
@@ -705,17 +723,29 @@ static int pg_reduce_scatter_rendezvous(pg_context_t *ctx, void *recvbuf, int co
 
     void *stage = malloc(stage_bytes);
     if (!stage) { fprintf(stderr, "stage buf alloc failed\n"); return -1; }
-    struct ibv_mr *stage_mr = ibv_reg_mr(ctx->pd, stage, stage_bytes,
-                                         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-    struct ibv_mr *recv_mr  = ibv_reg_mr(ctx->pd, recvbuf, (size_t) count * esz,
-                                         IBV_ACCESS_LOCAL_WRITE);
-    if (!stage_mr || !recv_mr) { fprintf(stderr, "MR registration failed (reduce_scatter)\n"); return -1; }
+    struct ibv_mr *stage_mr = NULL, *recv_mr = NULL, *send_mr = NULL;
+    int rc = -1;
+
+    stage_mr = ibv_reg_mr(ctx->pd, stage, stage_bytes,
+                          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    recv_mr = ibv_reg_mr(ctx->pd, recvbuf, (size_t) count * esz,
+                         IBV_ACCESS_LOCAL_WRITE);
+    if (sendbuf == recvbuf) {
+        send_mr = recv_mr;
+    } else {
+        send_mr = ibv_reg_mr(ctx->pd, (void *) sendbuf, (size_t) count * esz,
+                             0);
+    }
+    if (!stage_mr || !recv_mr || !send_mr) {
+        fprintf(stderr, "MR registration failed (reduce_scatter)\n");
+        goto cleanup;
+    }
 
     struct buf_info my_landing = { .addr = (uint64_t) stage, .rkey = stage_mr->rkey, .size = (uint32_t) stage_bytes };
     struct buf_info next_landing;
     if (exchange_landing_info(ctx, &my_landing, &next_landing)) {
         fprintf(stderr, "landing-info exchange failed (reduce_scatter)\n");
-        return -1;
+        goto cleanup;
     }
 
     /* nsegs_out captured from the PREVIOUS iteration: gates whether next's
@@ -736,7 +766,7 @@ static int pg_reduce_scatter_rendezvous(pg_context_t *ctx, void *recvbuf, int co
         /* The stage buffer is a single, reused region (same address every
          * step). An RDMA-write send-completion only proves the bytes landed
          * in next's memory -- it says nothing about whether next's CPU has
-         * finished reduce_apply()-ing the *previous* step's contents out of
+         * finished reducing the *previous* step's contents out of
          * that same buffer yet. Without an explicit ack, a fast sender can
          * race ahead and overwrite data its peer hasn't consumed.
          *
@@ -752,43 +782,45 @@ static int pg_reduce_scatter_rendezvous(pg_context_t *ctx, void *recvbuf, int co
             char ack;
             if (recv_all(ctx->sock_next, &ack, 1)) {
                 fprintf(stderr, "reduce_scatter: ack-from-next failed at step %d\n", s);
-                return -1;
+                goto cleanup;
             }
         }
 
         /* Pre-post receive placeholders before the peer starts writing. */
         for (int i = 0; i < nsegs_in; i++) post_dummy_recv(ctx->qp_prev, (uint64_t) i);
 
-        /* Post every outbound segment up front: sends of later segments
-         * proceed on the wire while earlier ones are still completing --
-         * this, combined with reducing arrived segments immediately
-         * below (via drain_step's callback), is the comm/compute overlap. */
+        /* Step zero forwards this rank's original chunk from sendbuf.
+         * Later steps forward the partial chunk produced in recvbuf by the
+         * previous step's callback. Post every outbound segment up front:
+         * later sends then overlap reduction of incoming segments. */
         for (int i = 0; i < nsegs_out; i++) {
             int seg_start, seg_len;
             seg_range(s_len, nsegs_out, i, &seg_start, &seg_len);
-            uint64_t laddr = (uint64_t) ((char *) recvbuf + (size_t) (s_start + seg_start) * esz);
+            const void *source_buf = s == 0 ? sendbuf : recvbuf;
+            struct ibv_mr *source_mr = s == 0 ? send_mr : recv_mr;
+            uint64_t laddr = (uint64_t) ((const char *) source_buf + (size_t) (s_start + seg_start) * esz);
             uint64_t raddr = next_landing.addr + (size_t) seg_start * esz;
             uint32_t wlen  = (uint32_t) (seg_len * esz);
 
             if (check_bounds(ctx->rank, "reduce_scatter local(send-src)",
-                              laddr, wlen, (uint64_t) recvbuf, (uint32_t) (count * esz)) ||
+                              laddr, wlen, (uint64_t) source_buf, (uint32_t) (count * esz)) ||
                 check_bounds(ctx->rank, "reduce_scatter remote(next stage)",
                               raddr, wlen, next_landing.addr, next_landing.size)) {
-                return -1;
+                goto cleanup;
             }
 
-            if (post_write_imm(ctx->qp_next, laddr, recv_mr->lkey, wlen,
+            if (post_write_imm(ctx->qp_next, laddr, source_mr->lkey, wlen,
                                 raddr, next_landing.rkey, (uint32_t) ((s << 8) | i), (uint64_t) i)) {
                 fprintf(stderr, "post_write_imm failed (reduce_scatter step %d)\n", s);
-                return -1;
+                goto cleanup;
             }
         }
 
-        struct rs_ctx rc = { .recvbuf = recvbuf, .dt = dt, .op = op, .stage = stage,
+        struct rs_ctx rc = { .sendbuf = sendbuf, .recvbuf = recvbuf, .dt = dt, .op = op, .stage = stage,
                               .chunk_start_elems = r_start, .nsegs = nsegs_in, .chunk_len = r_len };
-        if (drain_step(ctx, nsegs_out, nsegs_in, rs_seg_cb, &rc)) return -1;
+        if (drain_step(ctx, nsegs_out, nsegs_in, rs_seg_cb, &rc)) goto cleanup;
 
-        /* I've now fully reduce_apply()'d every segment prev wrote into my
+        /* I've now reduced every segment prev wrote into my
          * stage buffer this step -- tell prev it may safely reuse that same
          * buffer for step s+1's writes. Skip on the LAST step: there is no
          * step N-1, so nobody will ever wait for this one -- sending it
@@ -798,17 +830,21 @@ static int pg_reduce_scatter_rendezvous(pg_context_t *ctx, void *recvbuf, int co
             char ack = 1;
             if (send_all(ctx->sock_prev, &ack, 1)) {
                 fprintf(stderr, "reduce_scatter: ack-to-prev failed at step %d\n", s);
-                return -1;
+                goto cleanup;
             }
         }
 
         prev_nsegs_out = nsegs_out;
     }
 
-    ibv_dereg_mr(stage_mr);
-    ibv_dereg_mr(recv_mr);
+    rc = 0;
+
+cleanup:
+    if (send_mr && send_mr != recv_mr) ibv_dereg_mr(send_mr);
+    if (recv_mr) ibv_dereg_mr(recv_mr);
+    if (stage_mr) ibv_dereg_mr(stage_mr);
     free(stage);
-    return 0;
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -942,9 +978,8 @@ static int post_recv_into(struct ibv_qp *qp, uint64_t laddr, uint32_t lkey,
     return ibv_post_recv(qp, &wr, &bad);
 }
 
-/* Registration cache keyed on pointer identity: a benchmark loop or a
- * training loop calling pg_all_reduce() on the SAME sendbuf/recvbuf every
- * iteration should only pay ibv_reg_mr() once, not once per call. */
+/* Registration cache keyed on pointer identity: repeated collectives over
+ * the same result buffer should only pay ibv_reg_mr() once. */
 static struct ibv_mr *get_cached_mr(pg_context_t *ctx, void *buf, size_t bytes)
 {
     if (ctx->eager_mr && ctx->eager_mr_ptr == buf && ctx->eager_mr_size >= bytes)
@@ -958,8 +993,25 @@ static struct ibv_mr *get_cached_mr(pg_context_t *ctx, void *buf, size_t bytes)
     return ctx->eager_mr;
 }
 
-static int pg_reduce_scatter_eager(pg_context_t *ctx, void *recvbuf, int count,
-                                    DATATYPE dt, OPERATION op)
+static struct ibv_mr *get_cached_send_mr(pg_context_t *ctx, void *buf, size_t bytes)
+{
+    if (ctx->eager_send_mr && ctx->eager_send_mr_ptr == buf &&
+        ctx->eager_send_mr_size >= bytes)
+        return ctx->eager_send_mr;
+
+    if (ctx->eager_send_mr) {
+        ibv_dereg_mr(ctx->eager_send_mr);
+        ctx->eager_send_mr = NULL;
+    }
+
+    ctx->eager_send_mr = ibv_reg_mr(ctx->pd, buf, bytes, 0);
+    ctx->eager_send_mr_ptr = buf;
+    ctx->eager_send_mr_size = bytes;
+    return ctx->eager_send_mr;
+}
+
+static int pg_reduce_scatter_eager(pg_context_t *ctx, const void *sendbuf,
+                                    void *recvbuf, int count, DATATYPE dt, OPERATION op)
 {
     int N = ctx->world_size, r = ctx->rank;
     size_t esz = dt_size(dt);
@@ -967,7 +1019,11 @@ static int pg_reduce_scatter_eager(pg_context_t *ctx, void *recvbuf, int count,
 
     size_t total_bytes = (size_t) count * esz;
     struct ibv_mr *recv_mr = get_cached_mr(ctx, recvbuf, total_bytes);
+    struct ibv_mr *send_mr = sendbuf == recvbuf
+                           ? recv_mr
+                           : get_cached_send_mr(ctx, (void *) sendbuf, total_bytes);
     if (!recv_mr) { fprintf(stderr, "rank %d: eager recvbuf MR reg failed\n", r); return -1; }
+    if (!send_mr) { fprintf(stderr, "rank %d: eager sendbuf MR reg failed\n", r); return -1; }
 
     int max_chunk_elems = (count + N - 1) / N;
     size_t need_stage = (size_t) max_chunk_elems * esz;
@@ -1002,13 +1058,15 @@ static int pg_reduce_scatter_eager(pg_context_t *ctx, void *recvbuf, int count,
         for (int i = 0; i < nsegs_out; i++) {
             int seg_start, seg_len;
             seg_range(s_len, nsegs_out, i, &seg_start, &seg_len);
-            uint64_t laddr = (uint64_t) ((char *) recvbuf + (size_t) (s_start + seg_start) * esz);
+            const void *source_buf = s == 0 ? sendbuf : recvbuf;
+            struct ibv_mr *source_mr = s == 0 ? send_mr : recv_mr;
+            uint64_t laddr = (uint64_t) ((const char *) source_buf + (size_t) (s_start + seg_start) * esz);
             uint32_t wlen  = (uint32_t) (seg_len * esz);
             if (check_bounds(r, "eager reduce_scatter local(send-src)",
-                              laddr, wlen, (uint64_t) recvbuf, (uint32_t) total_bytes)) {
+                              laddr, wlen, (uint64_t) source_buf, (uint32_t) total_bytes)) {
                 return -1;
             }
-            if (post_send_data(ctx->qp_next, laddr, recv_mr->lkey, wlen, (uint64_t) i)) {
+            if (post_send_data(ctx->qp_next, laddr, source_mr->lkey, wlen, (uint64_t) i)) {
                 fprintf(stderr, "rank %d: eager post_send failed (reduce_scatter step %d)\n", r, s);
                 return -1;
             }
@@ -1016,7 +1074,7 @@ static int pg_reduce_scatter_eager(pg_context_t *ctx, void *recvbuf, int count,
 
         /* Same rs_ctx/rs_seg_cb as Rendezvous -- reduction doesn't care
          * whether the data arrived via RDMA Write or two-sided Send. */
-        struct rs_ctx rc = { .recvbuf = recvbuf, .dt = dt, .op = op, .stage = ctx->eager_stage,
+        struct rs_ctx rc = { .sendbuf = sendbuf, .recvbuf = recvbuf, .dt = dt, .op = op, .stage = ctx->eager_stage,
                               .chunk_start_elems = r_start, .nsegs = nsegs_in, .chunk_len = r_len };
         if (drain_step(ctx, nsegs_out, nsegs_in, rs_seg_cb, &rc)) return -1;
     }
@@ -1075,33 +1133,25 @@ static int pg_all_gather_eager(pg_context_t *ctx, void *recvbuf, int count, DATA
 }
 
 /* ------------------------------------------------------------------ */
-/* pg_all_reduce: protocol implementations + size-based router          */
+/* pg_all_reduce: out-of-place input/output, no full-vector memcpy.     */
 /* ------------------------------------------------------------------ */
 
-/* Strictly in-place: no memcpy. sendbuf/recvbuf must be the same pointer --
- * reduce-scatter and all-gather both operate directly on that one buffer. */
-static int pg_all_reduce_rendezvous(pg_context_t *ctx, void *sendbuf, void *recvbuf,
+/* Input and output may be separate or aliased. Reduce-Scatter seeds each
+ * output chunk from the local input plus the arriving partial reduction. */
+static int pg_all_reduce_rendezvous(pg_context_t *ctx, const void *sendbuf, void *recvbuf,
                                      int count, DATATYPE dt, OPERATION op)
 {
-    if (sendbuf != recvbuf) {
-        fprintf(stderr, "pg_all_reduce: library is strictly in-place; sendbuf must equal recvbuf\n");
-        return -1;
-    }
     if (ctx->world_size == 1) return 0;
-    if (pg_reduce_scatter_rendezvous(ctx, recvbuf, count, dt, op)) return -1;
+    if (pg_reduce_scatter_rendezvous(ctx, sendbuf, recvbuf, count, dt, op)) return -1;
     if (pg_all_gather_rendezvous(ctx, recvbuf, count, dt)) return -1;
     return 0;
 }
 
-static int pg_all_reduce_eager(pg_context_t *ctx, void *sendbuf, void *recvbuf,
+static int pg_all_reduce_eager(pg_context_t *ctx, const void *sendbuf, void *recvbuf,
                                 int count, DATATYPE dt, OPERATION op)
 {
-    if (sendbuf != recvbuf) {
-        fprintf(stderr, "pg_all_reduce: library is strictly in-place; sendbuf must equal recvbuf\n");
-        return -1;
-    }
     if (ctx->world_size == 1) return 0;
-    if (pg_reduce_scatter_eager(ctx, recvbuf, count, dt, op)) return -1;
+    if (pg_reduce_scatter_eager(ctx, sendbuf, recvbuf, count, dt, op)) return -1;
     if (pg_all_gather_eager(ctx, recvbuf, count, dt)) return -1;
     return 0;
 }
@@ -1137,21 +1187,25 @@ static double now_ms(void)
  * automatically as long as they all call this with the same (size,
  * protocol) sequence -- which pg_autotune_threshold() guarantees by never
  * branching on a per-rank measurement mid-sweep. */
-static double time_protocol_ms(pg_context_t *ctx, void *buf, int count, int use_eager)
+static int time_protocol_ms(pg_context_t *ctx, const void *sendbuf, void *recvbuf,
+                             int count, int use_eager, double *avg_ms)
 {
     for (int i = 0; i < AUTOTUNE_WARMUP; i++) {
-        memset(buf, 0, (size_t) count * sizeof(float));
-        if (use_eager) pg_all_reduce_eager(ctx, buf, buf, count, DT_FLOAT, OP_SUM);
-        else            pg_all_reduce_rendezvous(ctx, buf, buf, count, DT_FLOAT, OP_SUM);
+        int rc = use_eager
+               ? pg_all_reduce_eager(ctx, sendbuf, recvbuf, count, DT_FLOAT, OP_SUM)
+               : pg_all_reduce_rendezvous(ctx, sendbuf, recvbuf, count, DT_FLOAT, OP_SUM);
+        if (rc) return -1;
     }
     double t0 = now_ms();
     for (int i = 0; i < AUTOTUNE_TRIALS; i++) {
-        memset(buf, 0, (size_t) count * sizeof(float));
-        if (use_eager) pg_all_reduce_eager(ctx, buf, buf, count, DT_FLOAT, OP_SUM);
-        else            pg_all_reduce_rendezvous(ctx, buf, buf, count, DT_FLOAT, OP_SUM);
+        int rc = use_eager
+               ? pg_all_reduce_eager(ctx, sendbuf, recvbuf, count, DT_FLOAT, OP_SUM)
+               : pg_all_reduce_rendezvous(ctx, sendbuf, recvbuf, count, DT_FLOAT, OP_SUM);
+        if (rc) return -1;
     }
     double t1 = now_ms();
-    return (t1 - t0) / AUTOTUNE_TRIALS;
+    *avg_ms = (t1 - t0) / AUTOTUNE_TRIALS;
+    return 0;
 }
 
 /* Sweeps message sizes from AUTOTUNE_MIN_BYTES to AUTOTUNE_MAX_BYTES
@@ -1171,9 +1225,12 @@ int pg_autotune_threshold(void *pg_handle)
     if (!ctx) return -1;
 
     size_t max_bytes = AUTOTUNE_MAX_BYTES;
-    void *buf = malloc(max_bytes);
-    if (!buf) {
+    void *sendbuf = calloc(1, max_bytes);
+    void *recvbuf = malloc(max_bytes);
+    if (!sendbuf || !recvbuf) {
         fprintf(stderr, "rank %d: autotune alloc failed\n", ctx->rank);
+        free(sendbuf);
+        free(recvbuf);
         return -1;
     }
 
@@ -1188,8 +1245,14 @@ int pg_autotune_threshold(void *pg_handle)
         int count = (int) (bytes / sizeof(float));
         if (count < 1) count = 1;
 
-        double t_eager = time_protocol_ms(ctx, buf, count, 1);
-        double t_rend  = time_protocol_ms(ctx, buf, count, 0);
+        double t_eager, t_rend;
+        if (time_protocol_ms(ctx, sendbuf, recvbuf, count, 1, &t_eager) ||
+            time_protocol_ms(ctx, sendbuf, recvbuf, count, 0, &t_rend)) {
+            fprintf(stderr, "rank %d: collective failed during protocol autotuning\n", ctx->rank);
+            free(sendbuf);
+            free(recvbuf);
+            return -1;
+        }
 
         if (ctx->rank == 0) {
             fprintf(stderr, "  size=%8zu B  eager=%9.4f ms  rendezvous=%9.4f ms  -> %s\n",
@@ -1206,7 +1269,8 @@ int pg_autotune_threshold(void *pg_handle)
         }
     }
 
-    free(buf);
+    free(sendbuf);
+    free(recvbuf);
 
     size_t agreed = threshold;
     if (broadcast_from_rank0(ctx, &agreed)) {
@@ -1229,7 +1293,10 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
     pg_context_t *ctx = pg_handle;
     if (!ctx) return -1;
     size_t esz = dt_size(datatype);
-    if (esz == 0 || count <= 0) { fprintf(stderr, "pg_all_reduce: bad count/datatype\n"); return -1; }
+    if (!sendbuf || !recvbuf || esz == 0 || count <= 0 || !is_valid_operation(op)) {
+        fprintf(stderr, "pg_all_reduce: invalid buffer, count, datatype, or operation\n");
+        return -1;
+    }
 
     size_t nbytes = (size_t) count * esz;
     if (nbytes < ctx->eager_threshold_bytes)
@@ -1244,6 +1311,7 @@ int pg_close(void *pg_handle)
     int rc = 0;
 
     if (ctx->eager_mr && ibv_dereg_mr(ctx->eager_mr))            { fprintf(stderr, "dereg eager_mr failed\n"); rc = -1; }
+    if (ctx->eager_send_mr && ibv_dereg_mr(ctx->eager_send_mr))  { fprintf(stderr, "dereg eager_send_mr failed\n"); rc = -1; }
     if (ctx->eager_stage_mr && ibv_dereg_mr(ctx->eager_stage_mr)) { fprintf(stderr, "dereg eager_stage_mr failed\n"); rc = -1; }
     free(ctx->eager_stage);
 
@@ -1284,8 +1352,16 @@ static int tune_pipe_segs(void *pg_handle, int rank, int nhosts, int iters)
     const int nsizes = (int) (sizeof sizes / sizeof sizes[0]);
     const size_t max_bytes = sizes[nsizes - 1];
 
+    float *sendbuf = malloc(max_bytes);
     float *recvbuf = malloc(max_bytes);
-    if (!recvbuf) { fprintf(stderr, "alloc failed\n"); return -1; }
+    if (!sendbuf || !recvbuf) {
+        fprintf(stderr, "alloc failed\n");
+        free(sendbuf);
+        free(recvbuf);
+        return -1;
+    }
+    for (size_t i = 0; i < max_bytes / sizeof(float); i++)
+        sendbuf[i] = (float) (rank + 1);
 
     double expected = 0.0;
     for (int p = 0; p < nhosts; p++) expected += (p + 1);
@@ -1307,14 +1383,18 @@ static int tune_pipe_segs(void *pg_handle, int rank, int nhosts, int iters)
             g_pipe_segs = segs[k];
 
             for (int w = 0; w < WARMUP_ITERS; w++) {
-                for (int i = 0; i < count; i++) recvbuf[i] = (float) (rank + 1);
-                pg_all_reduce(recvbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle);
+                if (pg_all_reduce(sendbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle)) {
+                    fprintf(stderr, "pg_all_reduce warmup failed (size=%zu, PIPE_SEGS=%d)\n",
+                            sizes[s], g_pipe_segs);
+                    rc = -1;
+                    break;
+                }
             }
+            if (rc) break;
 
             double t0 = now_ms();
             for (int it = 0; it < iters; it++) {
-                for (int i = 0; i < count; i++) recvbuf[i] = (float) (rank + 1);
-                if (pg_all_reduce(recvbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle)) {
+                if (pg_all_reduce(sendbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle)) {
                     fprintf(stderr, "pg_all_reduce failed (size=%zu, PIPE_SEGS=%d)\n",
                             sizes[s], g_pipe_segs);
                     rc = -1;
@@ -1325,8 +1405,10 @@ static int tune_pipe_segs(void *pg_handle, int rank, int nhosts, int iters)
             t[k] = now_ms() - t0;
             if (t[k] < t[best]) best = k;
 
-            for (int i = 0; i < count; i++)
+            for (int i = 0; i < count; i++) {
                 if (fabs((double) recvbuf[i] - expected) > 1e-3) { ok = 0; break; }
+                if (sendbuf[i] != (float) (rank + 1)) { ok = 0; break; }
+            }
         }
 
         if (rank == 0 && rc == 0) {
@@ -1338,6 +1420,7 @@ static int tune_pipe_segs(void *pg_handle, int rank, int nhosts, int iters)
     }
     g_pipe_segs = saved;
 
+    free(sendbuf);
     free(recvbuf);
     return rc;
 }
@@ -1416,8 +1499,16 @@ int main(int argc, char *argv[])
     const size_t max_bytes = sizes[nsizes - 1];
 
     int rank = my_index - 1;
+    float *sendbuf = malloc(max_bytes);
     float *recvbuf = malloc(max_bytes);
-    if (!recvbuf) { fprintf(stderr, "alloc failed\n"); return 1; }
+    if (!sendbuf || !recvbuf) {
+        fprintf(stderr, "alloc failed\n");
+        free(sendbuf);
+        free(recvbuf);
+        return 1;
+    }
+    for (size_t i = 0; i < max_bytes / sizeof(float); i++)
+        sendbuf[i] = (float) (rank + 1);
 
     double expected = 0.0;
     for (int p = 0; p < nhosts; p++) expected += (p + 1);
@@ -1428,15 +1519,22 @@ int main(int argc, char *argv[])
         /* Warmup: a few untimed calls so the timed loop doesn't pay one-time
          * costs (first-touch page faults, MR registration, cold NIC paths). */
         for (int w = 0; w < WARMUP_ITERS; w++) {
-            for (int i = 0; i < count; i++) recvbuf[i] = (float) (rank + 1);
-            pg_all_reduce(recvbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle);
+            if (pg_all_reduce(sendbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle)) {
+                fprintf(stderr, "pg_all_reduce warmup failed (size=%zu B)\n", sizes[s]);
+                free(sendbuf);
+                free(recvbuf);
+                pg_close(pg_handle);
+                return 1;
+            }
         }
 
         double t0 = now_ms();
         for (int it = 0; it < iters; it++) {
-            for (int i = 0; i < count; i++) recvbuf[i] = (float) (rank + 1);
-            if (pg_all_reduce(recvbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle)) {
+            if (pg_all_reduce(sendbuf, recvbuf, count, DT_FLOAT, OP_SUM, pg_handle)) {
                 fprintf(stderr, "pg_all_reduce failed\n");
+                free(sendbuf);
+                free(recvbuf);
+                pg_close(pg_handle);
                 return 1;
             }
         }
@@ -1445,13 +1543,15 @@ int main(int argc, char *argv[])
         /* Verify the last result (outside the timer) */
         int ok = 1;
         for (int i = 0; i < count; i++) {
-            if (fabs((double) recvbuf[i] - expected) > 1e-3) { ok = 0; break; }
+            if (fabs((double) recvbuf[i] - expected) > 1e-3 ||
+                sendbuf[i] != (float) (rank + 1)) { ok = 0; break; }
         }
 
         printf("[rank %d] size=%8zu B: %d x all_reduce took %.3f ms total (%.4f ms avg) -> %s\n",
                rank, sizes[s], iters, total_ms, total_ms / iters, ok ? "OK" : "MISMATCH");
     }
 
+    free(sendbuf);
     free(recvbuf);
     pg_close(pg_handle);
     return 0;
