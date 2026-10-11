@@ -41,6 +41,7 @@
 /* Constants                                                          */
 /* ------------------------------------------------------------------ */
 
+#define MAX_INLINE_SIZE 64
 #define MAX_PROCESSES   4
 #define TCP_BASE_PORT   18800   /* rank r listens on TCP_BASE_PORT + r  */
 #define IB_PORT_DEFAULT 1
@@ -480,6 +481,7 @@ static struct ibv_qp *create_ring_qp(pg_context_t *ctx)
     attr.cap.max_recv_wr  = RQ_DEPTH;
     attr.cap.max_send_sge = 1;
     attr.cap.max_recv_sge = 1;
+    attr.cap.max_inline_data = MAX_INLINE_SIZE;
     return ibv_create_qp(ctx->pd, &attr);
 }
 
@@ -567,6 +569,10 @@ static int post_write_imm(struct ibv_qp *qp, uint64_t laddr, uint32_t lkey, uint
     wr.sg_list    = &sge;
     wr.num_sge    = 1;
     wr.send_flags = IBV_SEND_SIGNALED;
+
+    if (len <= MAX_INLINE_SIZE) {
+        wr.send_flags |= IBV_SEND_INLINE;
+    }
     wr.imm_data   = htonl(imm);
     wr.wr.rdma.remote_addr = raddr;
     wr.wr.rdma.rkey        = rkey;
@@ -953,7 +959,7 @@ static int post_send_imm(struct ibv_qp *qp, uint32_t imm_data, uint64_t wr_id)
     wr.opcode     = IBV_WR_SEND_WITH_IMM;
     wr.sg_list    = NULL;
     wr.num_sge    = 0;
-    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
     wr.imm_data   = htonl(imm_data);
     return ibv_post_send(qp, &wr, &bad);
 }
@@ -1516,6 +1522,10 @@ static int post_send_data(struct ibv_qp *qp, uint64_t laddr, uint32_t lkey,
     wr.sg_list    = &sge;
     wr.num_sge    = 1;
     wr.send_flags = IBV_SEND_SIGNALED;
+
+    if (len <= MAX_INLINE_SIZE) {
+        wr.send_flags |= IBV_SEND_INLINE;
+    }
     return ibv_post_send(qp, &wr, &bad);
 }
 
