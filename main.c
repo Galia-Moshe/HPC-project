@@ -45,35 +45,21 @@
 #define MAX_PROCESSES   4
 #define TCP_BASE_PORT   18800   /* rank r listens on TCP_BASE_PORT + r  */
 #define IB_PORT_DEFAULT 1
-/* These were 512/64/64 originally. Raised substantially: qp_next/qp_prev's
- * send and receive queues are now shared by several concurrent protocols
- * (reduce-scatter's credit-return traffic, all-gather's data writes AND its
- * metadata-announcement handshake), and a deadlock was observed that moved
- * to a LATER message size under a slower (-O0 debug) build despite running
- * the exact same deterministic call sequence -- a hang that shifts later
- * when the program runs slower is the signature of a timing-sensitive
- * resource race, not a fixed-count leak, so the fix is headroom: make it
- * far harder for any of these shared queues to run transiently dry. */
+/* Queue sizing: generous depths ensure send/recv queues never run dry
+ * during multi-step pipelining and concurrent control traffic. */
 #define CQ_SIZE         8192
 #define SQ_DEPTH        2048
 #define RQ_DEPTH        2048
 #define WC_BATCH        16
 #define PIPE_SEGS       16      /* pipeline segments per ring chunk */
+#define RZV_RING_SEGS   PIPE_SEGS /* ring buffer capacity (matches pipeline depth) */
 #define CONNECT_RETRIES 200     /* ~20s of retries at 100ms backoff     */
 
-/* Eager protocol: persistent stage buffer, large enough for the benchmark's
- * maximum message size. For N>=2, a reduce-scatter chunk is at most half. */
-#define EAGER_STAGE_BYTES (4 * 1024 * 1024)
-
-/* Rendezvous reduce-scatter: persistent ring buffer + RDMA credit-based flow
- * control. RZV_RING_SEGS is the ring's capacity in segments; RZV_STAGE_BYTES
- * is sized for the biggest chunk the benchmark will try, divided into
- * RZV_RING_SEGS equal
- * slots of RZV_SEG_BYTES each. RZV_CREDIT_BATCH is how many freed segments
- * the receiver accumulates before returning credits in one message. */
-#define RZV_RING_SEGS    16
-#define RZV_STAGE_BYTES  (4 * 1024 * 1024)
-#define RZV_SEG_BYTES    (RZV_STAGE_BYTES / RZV_RING_SEGS)
+/* Stage buffer sizing: 4 MB covers the maximum message size tested */
+#define MAX_STAGE_BYTES   (4 * 1024 * 1024)
+#define EAGER_STAGE_BYTES MAX_STAGE_BYTES
+#define RZV_STAGE_BYTES   MAX_STAGE_BYTES
+#define RZV_SEG_BYTES     (RZV_STAGE_BYTES / RZV_RING_SEGS)
 #define RZV_CREDIT_BATCH 4
 #define RZV_BARRIER_ARRIVE_IMM UINT32_C(0xFFFFFFFE)
 #define RZV_BARRIER_RELEASE_IMM UINT32_C(0xFFFFFFFD)
@@ -116,6 +102,13 @@ struct buf_info {
     uint32_t size;
 };
 
+typedef struct {
+    void          *ptr;
+    size_t         size;
+    int            access;
+    struct ibv_mr *mr;
+} mr_cache_t;
+
 /* ------------------------------------------------------------------ */
 /* pg_handle: the custom struct required by the exercise               */
 /* ------------------------------------------------------------------ */
@@ -155,12 +148,14 @@ typedef struct {
     struct ibv_mr   *rzv_stage_mr;
     struct buf_info  remote_rzv_stage;    /* next rank's ring buffer: addr/rkey/size to RDMA-Write into */
     int               rzv_barrier_arrive_seen; /* arrival token may be polled during Reduce-Scatter */
+    /* Unified user-buffer MR caches (shared across Reduce-Scatter, All-Gather, Eager, and Rendezvous) */
+    mr_cache_t       recv_mr_cache;
+    mr_cache_t       send_mr_cache;
 
-    /* --- All-Gather Rendezvous: MR cache + in-band RDMA metadata exchange
-     * (replaces per-call ibv_reg_mr + TCP exchange_landing_info). --- */
-    void             *ag_cached_ptr;    /* recvbuf pointer the cache below is valid for */
-    size_t            ag_cached_size;   /* and the byte size it was registered at       */
-    struct ibv_mr    *ag_local_mr;      /* MR for ag_cached_ptr, kept across calls       */
+    /* --- All-Gather Rendezvous: in-band RDMA metadata exchange --- */
+    void             *ag_announced_ptr;
+    size_t            ag_announced_size;
+    int               ag_meta_arrived;  /* 1 if next's announcement arrived early during barrier */
     struct buf_info   ag_remote_info;   /* next's CURRENT recvbuf addr/rkey/size, kept
                                           * fresh via RDMA announcements from next        */
 
@@ -170,29 +165,48 @@ typedef struct {
                                           * (next RDMA-Writes INTO it)                    */
     struct ibv_mr    *meta_send_mr;
     struct ibv_mr    *meta_recv_mr;
-    struct buf_info   remote_meta_prev; /* prev's meta_recv_buf addr/rkey -- learned ONCE
-                                          * at connect time via a REVERSED TCP exchange
-                                          * (send on sock_next, recv on sock_prev, instead
-                                          * of exchange_landing_info()'s usual direction):
-                                          * the all-gather DATA flow writes into next, same
-                                          * as reduce-scatter, but its per-call metadata
-                                          * announcement flows the OTHER way -- every rank
-                                          * announces its own recvbuf to its PREV, so prev
-                                          * can write all-gather data into it -- so what's
-                                          * needed here is prev's meta_recv_buf, not next's. */
+    struct buf_info   remote_meta_prev; /* prev's meta_recv_buf addr/rkey for All-Gather announcements */
 
-    /* MR cache for a stable output buffer reused across collectives. */
-    void          *eager_mr_ptr;
-    size_t         eager_mr_size;
-    struct ibv_mr *eager_mr;
 
-    /* Separate cache for the immutable All-Reduce input when sendbuf and
-     * recvbuf are distinct. */
-    void          *eager_send_mr_ptr;
-    size_t         eager_send_mr_size;
-    struct ibv_mr *eager_send_mr;
 
 } pg_context_t;
+
+/* Unified registration cache keyed on pointer identity: user buffers reused across
+ * collectives only pay ibv_reg_mr() once, not once per call. */
+static struct ibv_mr *get_cached_mr(struct ibv_pd *pd, mr_cache_t *cache,
+                                    const void *buf, size_t bytes, int access)
+{
+    if (cache->mr && cache->ptr == buf && cache->size >= bytes && (cache->access & access) == access)
+        return cache->mr;
+
+    if (cache->mr) {
+        ibv_dereg_mr(cache->mr);
+        cache->mr = NULL;
+    }
+
+    cache->mr = ibv_reg_mr(pd, (void *) buf, bytes, access);
+    if (cache->mr) {
+        cache->ptr    = (void *) buf;
+        cache->size   = bytes;
+        cache->access = access;
+    } else {
+        cache->ptr    = NULL;
+        cache->size   = 0;
+        cache->access = 0;
+    }
+    return cache->mr;
+}
+
+static void release_cached_mr(mr_cache_t *cache)
+{
+    if (cache->mr) {
+        ibv_dereg_mr(cache->mr);
+        cache->mr = NULL;
+    }
+    cache->ptr = NULL;
+    cache->size = 0;
+    cache->access = 0;
+}
 
 /* ------------------------------------------------------------------ */
 /* Global topology config, populated from -myindex / -list before      */
@@ -235,11 +249,17 @@ static size_t dt_size(DATATYPE dt)
 #define OP_PROD_F(a, b) ((a) * (b))
 
 #define REDUCE_SEED_LOOP(T, EXPR) do {                              \
-        T *d = (T *) dst;                                           \
-        const T *local = (const T *) local_src;                     \
-        const T *incoming = (const T *) incoming_src;               \
-        for (int _i = 0; _i < n; _i++)                              \
-            d[_i] = EXPR(local[_i], incoming[_i]);                  \
+        const T * restrict incoming = (const T *) incoming_src;     \
+        if (dst == local_src) {                                     \
+            T * restrict d = (T *) dst;                             \
+            for (int _i = 0; _i < n; _i++)                          \
+                d[_i] = EXPR(d[_i], incoming[_i]);                  \
+        } else {                                                    \
+            T * restrict d = (T *) dst;                             \
+            const T * restrict local = (const T *) local_src;       \
+            for (int _i = 0; _i < n; _i++)                          \
+                d[_i] = EXPR(local[_i], incoming[_i]);              \
+        }                                                           \
     } while (0)
 
 /* Seed a reduced chunk without copying local input first. */
@@ -285,18 +305,12 @@ static int is_valid_operation(OPERATION op)
 /* byte ranges without any extra metadata exchange).                   */
 /* ------------------------------------------------------------------ */
 
-static void chunk_range(int count, int N, int idx, int *start, int *len)
+/* Partitions 'total' elements evenly across 'parts', distributing remainder. */
+static void partition_range(int total, int parts, int idx, int *start, int *len)
 {
-    int base = count / N, rem = count % N;
+    int base = total / parts, rem = total % parts;
     if (idx < rem) { *len = base + 1; *start = idx * (base + 1); }
-    else            { *len = base;     *start = rem * (base + 1) + (idx - rem) * base; }
-}
-
-static void seg_range(int chunk_len, int nsegs, int seg_i, int *start, int *len)
-{
-    int base = chunk_len / nsegs, rem = chunk_len % nsegs;
-    if (seg_i < rem) { *len = base + 1; *start = seg_i * (base + 1); }
-    else              { *len = base;     *start = rem * (base + 1) + (seg_i - rem) * base; }
+    else           { *len = base;     *start = rem * (base + 1) + (idx - rem) * base; }
 }
 
 /* ------------------------------------------------------------------ */
@@ -387,12 +401,29 @@ static int exchange_landing_info(pg_context_t *ctx,
 }
 
 static int post_send_imm(struct ibv_qp *qp, uint32_t imm_data, uint64_t wr_id);
+static int post_recv_into(struct ibv_qp *qp, uint64_t laddr, uint32_t lkey, uint32_t len, uint64_t wr_id);
+static int post_dummy_recv(struct ibv_qp *qp, uint64_t wr_id);
 
 /* RDMA ring barrier between Reduce-Scatter and All-Gather. An arrival token
  * circulates once around the ring; rank 0 starts a release token only after
  * it returns, so every rank has finished Reduce-Scatter before any rank
  * enters All-Gather. The two immediate values are reserved for these tokens
  * and cannot be confused with the small Reduce-Scatter credit counts. */
+static int check_wc_status(pg_context_t *ctx, const struct ibv_wc *wc)
+{
+    if (wc->status != IBV_WC_SUCCESS) {
+        const char *role = (wc->qp_num == ctx->qp_next->qp_num) ? "qp_next" :
+                           (wc->qp_num == ctx->qp_prev->qp_num) ? "qp_prev" : "unknown-qp";
+        fprintf(stderr,
+                "[rank %d] WC error: %s (status=%d vendor_err=0x%x qp=%u[%s] wr_id=%llu opcode=%d byte_len=%u)\n",
+                ctx->rank, ibv_wc_status_str(wc->status), wc->status,
+                wc->vendor_err, wc->qp_num, role,
+                (unsigned long long) wc->wr_id, wc->opcode, wc->byte_len);
+        return -1;
+    }
+    return 0;
+}
+
 static int wait_rzv_barrier_token(pg_context_t *ctx, uint32_t expected)
 {
     for (;;) {
@@ -403,16 +434,24 @@ static int wait_rzv_barrier_token(pg_context_t *ctx, uint32_t expected)
             return -1;
         }
         if (ne == 0) continue;
-        if (wc.status != IBV_WC_SUCCESS) {
-            fprintf(stderr, "[rank %d] barrier WC error: %s (status=%d vendor_err=0x%x)\n",
-                    ctx->rank, ibv_wc_status_str(wc.status), wc.status, wc.vendor_err);
-            return -1;
-        }
+        if (check_wc_status(ctx, &wc)) return -1;
 
-        if (wc.qp_num == ctx->qp_next->qp_num && wc.opcode == IBV_WC_SEND &&
-            (wc.wr_id == RZV_BARRIER_ARRIVE_WR_ID ||
-             wc.wr_id == RZV_BARRIER_RELEASE_WR_ID))
-            continue; /* local completion for one of our control tokens */
+        if (wc.qp_num == ctx->qp_next->qp_num) {
+            if (wc.opcode == IBV_WC_SEND &&
+                (wc.wr_id == RZV_BARRIER_ARRIVE_WR_ID ||
+                 wc.wr_id == RZV_BARRIER_RELEASE_WR_ID))
+                continue; /* local completion for one of our control tokens */
+            if (wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+                ctx->ag_remote_info = *ctx->meta_recv_buf;
+                ctx->ag_meta_arrived = 1;
+                if (post_dummy_recv(ctx->qp_next, wc.wr_id)) return -1;
+                continue;
+            }
+            if (wc.opcode == IBV_WC_RECV) {
+                if (post_dummy_recv(ctx->qp_next, wc.wr_id)) return -1;
+                continue;
+            }
+        }
 
         if (wc.qp_num != ctx->qp_prev->qp_num || wc.opcode != IBV_WC_RECV) {
             fprintf(stderr,
@@ -579,17 +618,21 @@ static int post_write_imm(struct ibv_qp *qp, uint64_t laddr, uint32_t lkey, uint
     return ibv_post_send(qp, &wr, &bad);
 }
 
-/* RDMA-Write-with-Immediate delivers its payload directly to the address
- * named in the WRITE itself; the matching receive WR only needs to exist
- * so the HW has somewhere to place the completion (no data buffer). */
-static int post_dummy_recv(struct ibv_qp *qp, uint64_t wr_id)
+static int post_recv_into(struct ibv_qp *qp, uint64_t laddr, uint32_t lkey,
+                          uint32_t len, uint64_t wr_id)
 {
+    struct ibv_sge sge = { .addr = laddr, .length = len, .lkey = lkey };
     struct ibv_recv_wr wr, *bad;
     memset(&wr, 0, sizeof wr);
     wr.wr_id   = wr_id;
-    wr.sg_list = NULL;
-    wr.num_sge = 0;
+    wr.sg_list = (len > 0) ? &sge : NULL;
+    wr.num_sge = (len > 0) ? 1 : 0;
     return ibv_post_recv(qp, &wr, &bad);
+}
+
+static int post_dummy_recv(struct ibv_qp *qp, uint64_t wr_id)
+{
+    return post_recv_into(qp, 0, 0, 0, wr_id);
 }
 
 /* Defensive check: reject an RDMA op locally, with a clear message, before
@@ -623,18 +666,13 @@ int connect_process_group(char *servername, void **pg_handle)
 {
     (void) servername; /* ring roster comes from pg_set_topology() / CLI */
 
-    if (g_config.world_size < 2 || g_config.my_index <= 0) {
-        fprintf(stderr, "connect_process_group: topology not set "
-                         "(need at least 2 processes; call pg_set_topology first)\n");
+    if (g_config.world_size < 2 || g_config.my_index <= 0|| g_config.world_size < g_config.my_index) {
+        fprintf(stderr, "connect_process_group: invalid topology\n");
         return -1;
     }
 
     int N    = g_config.world_size;
     int rank = g_config.my_index - 1;
-    if (rank < 0 || rank >= N) {
-        fprintf(stderr, "connect_process_group: -myindex out of range\n");
-        return -1;
-    }
 
     pg_context_t *ctx = calloc(1, sizeof *ctx);
     if (!ctx) return -1;
@@ -690,13 +728,7 @@ int connect_process_group(char *servername, void **pg_handle)
     uint32_t my_psn_next = lrand48() & 0xffffff;
     uint32_t my_psn_prev = lrand48() & 0xffffff;
 
-    /* ---- ring bootstrap over TCP -------------------------------------
-     * Every rank does the SAME four steps; deadlock-free because
-     * listen() happens before any connect() (so no connect races an
-     * un-started listener for long -- tcp_connect_retry() absorbs any
-     * residual startup skew) and every subsequent recv() waits on data
-     * the peer sends unconditionally right after its own connect/accept,
-     * never on anything that depends on our own later progress. */
+    /* ---- ring bootstrap over TCP -------------------------------------*/
     int listen_fd = tcp_listen(TCP_BASE_PORT + rank);
     if (listen_fd < 0) { fprintf(stderr, "listen on port %d failed\n", TCP_BASE_PORT + rank); return -1; }
 
@@ -755,10 +787,7 @@ int connect_process_group(char *servername, void **pg_handle)
             rank, N, ctx->hostnames[ctx->prev_rank], ctx->hostnames[ctx->next_rank],
             ctx->qp_next->qp_num, ctx->qp_prev->qp_num);
 
-    /* Eager's stage buffer is registered ONCE, here, for the lifetime of the
-     * process group -- that's the whole point of the Eager path: unlike
-     * Rendezvous (which registers/exchanges a fresh landing buffer every
-     * call), small messages pay zero setup cost per pg_all_reduce(). */
+    /* ---- Eager's stage buffer register -----------------------------------*/
     ctx->eager_stage_bytes = EAGER_STAGE_BYTES;
     ctx->eager_stage = malloc(ctx->eager_stage_bytes);
     if (!ctx->eager_stage) { fprintf(stderr, "rank %d: eager stage alloc failed\n", rank); return -1; }
@@ -766,14 +795,7 @@ int connect_process_group(char *servername, void **pg_handle)
                                       ctx->eager_stage_bytes, IBV_ACCESS_LOCAL_WRITE);
     if (!ctx->eager_stage_mr) { fprintf(stderr, "rank %d: eager stage MR reg failed\n", rank); return -1; }
 
-    /* Rendezvous reduce-scatter's ring buffer: same one-time setup pattern
-     * as the Eager stage buffer above, except its (addr, rkey) also has to
-     * be handed to next over the already-open control sockets -- Eager
-     * never needs that exchange at all (two-sided Send/Recv), but a
-     * one-sided RDMA Write always needs the target's (addr, rkey) in hand
-     * before it can be posted. Doing it once, here, is what lets
-     * pg_reduce_scatter_rendezvous() skip the malloc/ibv_reg_mr/TCP
-     * round trip it used to pay on every single call. */
+    /* ---- Rendezvous stage buffer register --------------------------------*/
     ctx->rzv_stage = malloc(RZV_STAGE_BYTES);
     if (!ctx->rzv_stage) { fprintf(stderr, "rank %d: rzv stage alloc failed\n", rank); return -1; }
     ctx->rzv_stage_mr = ibv_reg_mr(ctx->pd, ctx->rzv_stage, RZV_STAGE_BYTES,
@@ -788,12 +810,7 @@ int connect_process_group(char *servername, void **pg_handle)
         return -1;
     }
 
-    /* All-Gather Rendezvous: MR cache + in-band RDMA metadata exchange.
-     * meta_send_buf/meta_recv_buf are allocated and registered exactly once,
-     * here, for the process group's lifetime -- this is what lets
-     * pg_all_gather_rendezvous() skip both ibv_reg_mr() and the TCP
-     * landing-info round trip on every call, paying them only when the
-     * caller's recvbuf pointer/size actually changes. */
+    /* All-Gather Rendezvous: metadata staging/landing buffers. */
     ctx->meta_send_buf = malloc(sizeof *ctx->meta_send_buf);
     ctx->meta_recv_buf = malloc(sizeof *ctx->meta_recv_buf);
     if (!ctx->meta_send_buf || !ctx->meta_recv_buf) {
@@ -809,13 +826,7 @@ int connect_process_group(char *servername, void **pg_handle)
         return -1;
     }
 
-    /* Learn PREV's meta_recv_buf address/rkey -- the one thing the all-gather
-     * phase still needs from TCP, paid exactly once, here, never again per
-     * call. This is a REVERSED exchange relative to exchange_landing_info()
-     * (which always tells you about NEXT): sending on sock_next / receiving
-     * on sock_prev (instead of the usual prev/next) delivers prev's
-     * meta_recv_buf info instead -- see the field comment on
-     * remote_meta_prev for why that's the direction actually needed here. */
+    /* Exchange All-Gather metadata landing descriptors with prev. */
     struct buf_info my_meta_landing = { .addr = (uint64_t) ctx->meta_recv_buf,
                                          .rkey = ctx->meta_recv_mr->rkey,
                                          .size = (uint32_t) sizeof *ctx->meta_recv_buf };
@@ -877,7 +888,7 @@ static void rs_seg_cb(void *user, uint64_t wr_id)
     struct rs_ctx *rc = user;
     int seg_i = (int) wr_id;
     int seg_start, seg_len;
-    seg_range(rc->chunk_len, rc->nsegs, seg_i, &seg_start, &seg_len);
+    partition_range(rc->chunk_len, rc->nsegs, seg_i, &seg_start, &seg_len);
     size_t esz = dt_size(rc->dt);
     size_t elem_offset = (size_t) (rc->chunk_start_elems + seg_start) * esz;
     void *dst = (char *) rc->recvbuf + elem_offset;
@@ -887,27 +898,10 @@ static void rs_seg_cb(void *user, uint64_t wr_id)
 }
 
 /* ------------------------------------------------------------------ */
-/* Reduce-Scatter (Rendezvous): a single continuous, free-running pipeline */
-/* over a persistent ring buffer, with RDMA credit-based flow control as   */
-/* the only back-pressure -- there is no per-step barrier. All N-1 ring    */
-/* steps' segments are flattened up front (see out_segs/in_segs below)     */
-/* into one global send order and one global receive order; the k-th      */
-/* segment either side ever sends/receives (across the WHOLE call, not    */
-/* just one step) lands in ring slot k % RZV_RING_SEGS. Both sides agree   */
-/* on that slot without exchanging anything, because RC delivers writes    */
-/* in the exact order they were posted -- so wr_id alone is a reliable     */
-/* global index into the flattened arrays on arrival.                      */
-/*                                                                          */
-/* Flow control is credit-based instead of the old TCP ack: `credits`      */
-/* tracks how many of NEXT's ring slots are currently free for ME to       */
-/* write into (starts at RZV_RING_SEGS -- the whole ring -- since the      */
-/* previous call always drains back to full before it returns). Every      */
-/* write consumes one credit; credits are replenished only when NEXT        */
-/* explicitly returns them via a 0-byte IBV_WR_SEND_WITH_IMM, batched in    */
-/* groups of RZV_CREDIT_BATCH so we're not paying a two-sided round trip    */
-/* for every single segment. A segment advances when its prior-step         */
-/* reduction is ready and a credit is available, allowing useful overlap   */
-/* while still preserving the Reduce-Scatter data dependencies.             */
+/* Reduce-Scatter (Rendezvous): continuous pipelined transfer over     */
+/* the persistent ring buffer, regulated by RDMA credit flow control.  */
+/* Segments across all steps are flattened into an order-preserving    */
+/* schedule, allowing communication and computation to overlap fully.  */
 /* ------------------------------------------------------------------ */
 
 /* One entry per segment, in global send/receive order across the WHOLE
@@ -979,15 +973,9 @@ static int post_send_imm(struct ibv_qp *qp, uint32_t imm_data, uint64_t wr_id)
  *                                          recv so the next one never RNRs.
  *   qp_next + IBV_WC_RDMA_WRITE           -> our own data write to next
  *                                          completed: (*got_send)++.
- * Credit traffic is handled inline and never counts toward *got_send/
- * *got_recv, which track DATA completions only. *credit_sends_pending
- * exists so the caller can wait for every credit-return SEND it posted to
- * actually complete before returning -- otherwise a late completion for
- * one of OUR OWN credit-return sends could still be sitting unconsumed in
- * the CQ when the next phase (e.g. pg_all_gather_rendezvous) starts
- * polling it, and its drain_step() has no idea credit traffic exists: it
- * blindly counts anything on qp_prev as incoming data, miscounting that
- * leftover completion and desyncing the whole phase. */
+ * Credit traffic is handled inline without incrementing got_send/got_recv.
+ * *credit_sends_pending tracks local credit SEND completions to ensure all
+ * posted credit-returns complete before returning. */
 static int rzv_poll_once(pg_context_t *ctx, struct rzv_rs_ctx *rc,
                           int *got_send, int *got_recv,
                           int *credits, int *freed_batch,
@@ -998,18 +986,7 @@ static int rzv_poll_once(pg_context_t *ctx, struct rzv_rs_ctx *rc,
     if (ne < 0) { fprintf(stderr, "poll_cq failed\n"); return -1; }
 
     for (int i = 0; i < ne; i++) {
-        if (wc[i].status != IBV_WC_SUCCESS) {
-            const char *role =
-                (wc[i].qp_num == ctx->qp_next->qp_num) ? "qp_next" :
-                (wc[i].qp_num == ctx->qp_prev->qp_num) ? "qp_prev" : "unknown-qp";
-            fprintf(stderr,
-                    "[rank %d] WC error: %s (status=%d vendor_err=0x%x qp=%u[%s] "
-                    "wr_id=%llu opcode=%d byte_len=%u)\n",
-                    ctx->rank, ibv_wc_status_str(wc[i].status), wc[i].status,
-                    wc[i].vendor_err, wc[i].qp_num, role,
-                    (unsigned long long) wc[i].wr_id, wc[i].opcode, wc[i].byte_len);
-            return -1;
-        }
+        if (check_wc_status(ctx, &wc[i])) return -1;
         if (wc[i].opcode == IBV_WC_SEND &&
             (wc[i].wr_id == RZV_BARRIER_ARRIVE_WR_ID ||
              wc[i].wr_id == RZV_BARRIER_RELEASE_WR_ID))
@@ -1082,16 +1059,14 @@ static int pg_reduce_scatter_rendezvous(pg_context_t *ctx, const void *sendbuf,
         return -1;
     }
 
-    struct ibv_mr *recv_mr = ibv_reg_mr(ctx->pd, recvbuf, (size_t) count * esz, IBV_ACCESS_LOCAL_WRITE);
+    size_t total_bytes = (size_t) count * esz;
+    struct ibv_mr *recv_mr = get_cached_mr(ctx->pd, &ctx->recv_mr_cache, recvbuf, total_bytes,
+                                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     if (!recv_mr) { fprintf(stderr, "recvbuf MR registration failed (reduce_scatter)\n"); return -1; }
-    struct ibv_mr *send_mr = sendbuf == recvbuf
+    struct ibv_mr *send_mr = (sendbuf == recvbuf)
                            ? recv_mr
-                           : ibv_reg_mr(ctx->pd, (void *) sendbuf, (size_t) count * esz, 0);
-    if (!send_mr) {
-        fprintf(stderr, "sendbuf MR registration failed (reduce_scatter)\n");
-        ibv_dereg_mr(recv_mr);
-        return -1;
-    }
+                           : get_cached_mr(ctx->pd, &ctx->send_mr_cache, sendbuf, total_bytes, 0);
+    if (!send_mr) { fprintf(stderr, "sendbuf MR registration failed (reduce_scatter)\n"); return -1; }
 
     /* Flatten every ring step's segments into two global, order-preserving
      * lists up front -- this is what removes the old per-step barrier:
@@ -1103,26 +1078,25 @@ static int pg_reduce_scatter_rendezvous(pg_context_t *ctx, const void *sendbuf,
     struct rzv_seg_desc out_segs[RZV_MAX_SEGS_PER_CALL];
     struct rzv_seg_desc in_segs[RZV_MAX_SEGS_PER_CALL];
     int out_step_start[MAX_PROCESSES - 1], in_step_start[MAX_PROCESSES - 1];
-    int out_step_count[MAX_PROCESSES - 1], in_step_count[MAX_PROCESSES - 1];
+    int in_step_count[MAX_PROCESSES - 1];
     int total_out = 0, total_in = 0;
 
     for (int s = 0; s < N - 1; s++) {
         int send_idx = ((r - s) % N + N) % N;
         int recv_idx = ((r - s - 1) % N + N) % N;
         int s_start, s_len, r_start, r_len;
-        chunk_range(count, N, send_idx, &s_start, &s_len);
-        chunk_range(count, N, recv_idx, &r_start, &r_len);
+        partition_range(count, N, send_idx, &s_start, &s_len);
+        partition_range(count, N, recv_idx, &r_start, &r_len);
 
         int nsegs_out = s_len > 0 ? (s_len < RZV_RING_SEGS ? s_len : RZV_RING_SEGS) : 0;
         int nsegs_in  = r_len > 0 ? (r_len < RZV_RING_SEGS ? r_len : RZV_RING_SEGS) : 0;
         out_step_start[s] = total_out;
         in_step_start[s] = total_in;
-        out_step_count[s] = nsegs_out;
         in_step_count[s] = nsegs_in;
 
         for (int i = 0; i < nsegs_out; i++) {
             int seg_start, seg_len;
-            seg_range(s_len, nsegs_out, i, &seg_start, &seg_len);
+            partition_range(s_len, nsegs_out, i, &seg_start, &seg_len);
             out_segs[total_out].offset = s_start + seg_start;
             out_segs[total_out].len    = seg_len;
             out_segs[total_out].from_sendbuf = (s == 0);
@@ -1130,7 +1104,7 @@ static int pg_reduce_scatter_rendezvous(pg_context_t *ctx, const void *sendbuf,
         }
         for (int i = 0; i < nsegs_in; i++) {
             int seg_start, seg_len;
-            seg_range(r_len, nsegs_in, i, &seg_start, &seg_len);
+            partition_range(r_len, nsegs_in, i, &seg_start, &seg_len);
             in_segs[total_in].offset = r_start + seg_start;
             in_segs[total_in].len    = seg_len;
             in_segs[total_in].produces_out = -1;
@@ -1138,28 +1112,10 @@ static int pg_reduce_scatter_rendezvous(pg_context_t *ctx, const void *sendbuf,
         }
     }
 
-    /* A segment sent in step s+1 is the partial reduction received in step
-     * s. Record that dependency explicitly: ring credits protect staging
-     * slots from reuse, but do not mean the CPU has reduced a segment yet. */
+    /* Record data dependencies: segment sent in step s+1 is the partial reduction from step s. */
     for (int s = 0; s < N - 2; s++) {
-        if (in_step_count[s] != out_step_count[s + 1]) {
-            fprintf(stderr, "[rank %d] reduce-scatter segment mapping mismatch at step %d\n", r, s);
-            ibv_dereg_mr(recv_mr);
-            if (send_mr != recv_mr) ibv_dereg_mr(send_mr);
-            return -1;
-        }
         for (int i = 0; i < in_step_count[s]; i++) {
-            int in_idx = in_step_start[s] + i;
-            int out_idx = out_step_start[s + 1] + i;
-            if (in_segs[in_idx].offset != out_segs[out_idx].offset ||
-                in_segs[in_idx].len != out_segs[out_idx].len) {
-                fprintf(stderr, "[rank %d] reduce-scatter segment mismatch at step %d, segment %d\n",
-                        r, s, i);
-                ibv_dereg_mr(recv_mr);
-                if (send_mr != recv_mr) ibv_dereg_mr(send_mr);
-                return -1;
-            }
-            in_segs[in_idx].produces_out = out_idx;
+            in_segs[in_step_start[s] + i].produces_out = out_step_start[s + 1] + i;
         }
     }
 
@@ -1171,8 +1127,8 @@ static int pg_reduce_scatter_rendezvous(pg_context_t *ctx, const void *sendbuf,
     for (int i = 0; i < total_in; i++) {
         if (post_dummy_recv(ctx->qp_prev, (uint64_t) i)) {
             fprintf(stderr, "[rank %d] data-recv pre-post failed\n", ctx->rank);
-            ibv_dereg_mr(recv_mr);
-            if (send_mr != recv_mr) ibv_dereg_mr(send_mr);
+            release_cached_mr(&ctx->recv_mr_cache);
+            release_cached_mr(&ctx->send_mr_cache);
             return -1;
         }
     }
@@ -1185,8 +1141,8 @@ static int pg_reduce_scatter_rendezvous(pg_context_t *ctx, const void *sendbuf,
         uint64_t wr_id = i == 0 ? RZV_BARRIER_ARRIVE_RECV_WR_ID : RZV_BARRIER_RELEASE_RECV_WR_ID;
         if (post_dummy_recv(ctx->qp_prev, wr_id)) {
             fprintf(stderr, "[rank %d] barrier receive pre-post failed\n", ctx->rank);
-            ibv_dereg_mr(recv_mr);
-            if (send_mr != recv_mr) ibv_dereg_mr(send_mr);
+            release_cached_mr(&ctx->recv_mr_cache);
+            release_cached_mr(&ctx->send_mr_cache);
             return -1;
         }
     }
@@ -1264,42 +1220,19 @@ static int pg_reduce_scatter_rendezvous(pg_context_t *ctx, const void *sendbuf,
         freed_batch = 0;
     }
 
-    /* Drain until every credit we handed out this call has come back (so
-     * the NEXT pg_all_reduce() call starts from a fully-credited ring
-     * buffer) AND every credit-return SEND we ourselves posted has
-     * actually completed. The latter matters because this QP/CQ pair is
-     * shared with pg_all_gather_rendezvous right after we return: its
-     * drain_step() has no notion of credit traffic and would misinterpret
-     * any leftover completion on qp_prev as incoming all-gather data,
-     * desyncing that phase. No more real data is expected at this point --
-     * only credit-return traffic in both directions. */
+    /* Drain remaining credits and local SEND completions before proceeding. */
     while (credits < RZV_RING_SEGS || credit_sends_pending > 0) {
         if (rzv_poll_once(ctx, &rc, &got_send, &got_recv, &credits, &freed_batch,
                            &credit_sends_pending)) return -1;
     }
 
-    if (send_mr != recv_mr) ibv_dereg_mr(send_mr);
-    ibv_dereg_mr(recv_mr);
     return 0;
 }
 
 /* ------------------------------------------------------------------ */
-/* All-Gather: zero-copy. Every segment is RDMA-Written straight from   */
-/* the sender's recvbuf chunk into the SAME byte offset of the peer's   */
-/* recvbuf -- no staging buffer, no memcpy on either side.              */
-/*                                                                      */
-/* MR + landing-info are now cached across calls (ctx->ag_local_mr /    */
-/* ctx->ag_remote_info): ibv_reg_mr() and the metadata exchange only    */
-/* happen when the caller's (recvbuf, size) actually changes from the   */
-/* previous call -- the common case (a benchmark/training loop reusing  */
-/* the same buffer) pays neither cost again. On a cache miss, the       */
-/* metadata exchange itself is pure RDMA, not TCP: each rank announces  */
-/* its own recvbuf by RDMA-Writing it into its PREV's meta_recv_buf (see*/
-/* remote_meta_prev's comment for why that's "prev" and not "next"),    */
-/* and learns its NEXT's current recvbuf the same way, in reverse, via  */
-/* its own meta_recv_buf. TCP is used only once, ever, in               */
-/* connect_process_group(), to learn the META_RECV_BUF *addresses*      */
-/* themselves -- never again per call, and never for the recvbuf data.  */
+/* All-Gather (Rendezvous): zero-copy RDMA Write directly into the     */
+/* peer's recvbuf. Memory regions are cached across calls, and          */
+/* destination descriptors are refreshed in-band over RDMA on change.   */
 /* ------------------------------------------------------------------ */
 
 /* Polls the CQ once for all_gather's traffic mix and dispatches by
@@ -1341,24 +1274,13 @@ static int ag_poll_once(pg_context_t *ctx, int *got_send, int *got_recv, int *me
     if (ne < 0) { fprintf(stderr, "poll_cq failed\n"); return -1; }
 
     for (int i = 0; i < ne; i++) {
-        if (wc[i].status != IBV_WC_SUCCESS) {
-            const char *role =
-                (wc[i].qp_num == ctx->qp_next->qp_num) ? "qp_next" :
-                (wc[i].qp_num == ctx->qp_prev->qp_num) ? "qp_prev" : "unknown-qp";
-            fprintf(stderr,
-                    "[rank %d] WC error: %s (status=%d vendor_err=0x%x qp=%u[%s] "
-                    "wr_id=%llu opcode=%d byte_len=%u)\n",
-                    ctx->rank, ibv_wc_status_str(wc[i].status), wc[i].status,
-                    wc[i].vendor_err, wc[i].qp_num, role,
-                    (unsigned long long) wc[i].wr_id, wc[i].opcode, wc[i].byte_len);
-            return -1;
-        }
+        if (check_wc_status(ctx, &wc[i])) return -1;
 
         if (wc[i].qp_num == ctx->qp_prev->qp_num) {
             if (wc[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
                 (*got_recv)++;
             }else if (wc[i].opcode == IBV_WC_RDMA_WRITE) {
-                /* השלמת שליחת המטא-דאטה אל השכן הקודם בעת פספוס במטמון */
+                /* metadata announcement write to prev completed */
                 (*got_send)++;
             }
             /* else: IBV_WC_SEND -- stray credit-return-send completion; nothing to do. */
@@ -1392,22 +1314,18 @@ static int pg_all_gather_rendezvous(pg_context_t *ctx, void *recvbuf, int count,
     size_t bytes = (size_t) count * esz;
     int meta_send_pending = 0;
 
-    if (ctx->ag_cached_ptr != recvbuf || ctx->ag_cached_size != bytes) {
-        /* Cache miss: (re)register recvbuf and refresh the metadata both
-         * neighbours hold about it, entirely over RDMA. */
-        if (ctx->ag_local_mr) ibv_dereg_mr(ctx->ag_local_mr);
-        ctx->ag_local_mr = ibv_reg_mr(ctx->pd, recvbuf, bytes,
-                                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-        if (!ctx->ag_local_mr) {
-            fprintf(stderr, "recvbuf MR registration failed (all_gather)\n");
-            ctx->ag_cached_ptr = NULL;
-            return -1;
-        }
-        ctx->ag_cached_ptr  = recvbuf;
-        ctx->ag_cached_size = bytes;
-
+    int miss = (ctx->ag_announced_ptr != recvbuf || ctx->ag_announced_size != bytes);
+    struct ibv_mr *recv_mr = get_cached_mr(ctx->pd, &ctx->recv_mr_cache, recvbuf, bytes,
+                                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    if (!recv_mr) {
+        fprintf(stderr, "recvbuf MR registration failed (all_gather)\n");
+        return -1;
+    }
+    if (miss) {
+        ctx->ag_announced_ptr  = recvbuf;
+        ctx->ag_announced_size = bytes;
         *ctx->meta_send_buf = (struct buf_info) { .addr = (uint64_t) recvbuf,
-                                                    .rkey = ctx->ag_local_mr->rkey,
+                                                    .rkey = recv_mr->rkey,
                                                     .size = (uint32_t) bytes };
 
         /* Announce myself to prev (one-sided RDMA Write, not TCP) -- prev's
@@ -1429,7 +1347,9 @@ static int pg_all_gather_rendezvous(pg_context_t *ctx, void *recvbuf, int count,
          * announcement-write above has completed locally -- both must be
          * done before any data WR below can safely reference the SOURCE/
          * TARGET MRs this exchange just updated. */
-        int dummy_send = 0, dummy_recv = 0, meta_arrived = 0;
+        int dummy_send = 0, dummy_recv = 0;
+        int meta_arrived = ctx->ag_meta_arrived;
+        ctx->ag_meta_arrived = 0;
         while (!meta_arrived || meta_send_pending) {
             if (ag_poll_once(ctx, &dummy_send, &dummy_recv, &meta_arrived)) return -1;
             /* ag_poll_once() doesn't know about meta_send_pending (it isn't
@@ -1445,33 +1365,42 @@ static int pg_all_gather_rendezvous(pg_context_t *ctx, void *recvbuf, int count,
         }
     }
 
-    struct ibv_mr *recv_mr = ctx->ag_local_mr;
+
     struct buf_info next_landing = ctx->ag_remote_info;
+
+    /* Pre-post all data dummy receives up front across all steps to eliminate RNR NAK stalls. */
+    int total_in = 0;
+    for (int s = 0; s < N - 1; s++) {
+        int recv_idx = ((r - s) % N + N) % N;
+        int r_start, r_len;
+        partition_range(count, N, recv_idx, &r_start, &r_len);
+        int nsegs_in = r_len > 0 ? (r_len < PIPE_SEGS ? r_len : PIPE_SEGS) : 0;
+        total_in += nsegs_in;
+    }
+    for (int i = 0; i < total_in; i++) {
+        if (post_dummy_recv(ctx->qp_prev, (uint64_t) i)) {
+            fprintf(stderr, "[rank %d] all-gather data-recv pre-post failed\n", ctx->rank);
+            return -1;
+        }
+    }
+
+    int got_send = 0, got_recv = 0, dummy_meta = 0;
+    int expected_sends = 0, expected_recvs = 0;
 
     for (int s = 0; s < N - 1; s++) {
         int send_idx = ((r - s + 1) % N + N) % N;
         int recv_idx = ((r - s) % N + N) % N;
         int s_start, s_len, r_start, r_len;
-        chunk_range(count, N, send_idx, &s_start, &s_len);
-        chunk_range(count, N, recv_idx, &r_start, &r_len);
+        partition_range(count, N, send_idx, &s_start, &s_len);
+        partition_range(count, N, recv_idx, &r_start, &r_len);
 
         int nsegs_out = s_len > 0 ? (s_len < PIPE_SEGS ? s_len : PIPE_SEGS) : 0;
         int nsegs_in  = r_len > 0 ? (r_len < PIPE_SEGS ? r_len : PIPE_SEGS) : 0;
 
-        for (int i = 0; i < nsegs_in; i++) {
-            if (post_dummy_recv(ctx->qp_prev, (uint64_t) i)) {
-                fprintf(stderr, "[rank %d] all-gather metadata receive pre-post failed (segment %d)\n",
-                        ctx->rank, i);
-                return -1;
-            }
-        }
-
         for (int i = 0; i < nsegs_out; i++) {
             int seg_start, seg_len;
-            seg_range(s_len, nsegs_out, i, &seg_start, &seg_len);
+            partition_range(s_len, nsegs_out, i, &seg_start, &seg_len);
             uint64_t laddr = (uint64_t) ((char *) recvbuf + (size_t) (s_start + seg_start) * esz);
-            /* zero-copy: target offset is the SAME chunk position in the
-             * peer's own recvbuf -- final data lands there directly. */
             uint64_t raddr = next_landing.addr + (size_t) (s_start + seg_start) * esz;
             uint32_t wlen  = (uint32_t) (seg_len * esz);
 
@@ -1489,27 +1418,20 @@ static int pg_all_gather_rendezvous(pg_context_t *ctx, void *recvbuf, int count,
             }
         }
 
-        /* No callback needed: the RDMA Write already deposited the final
-         * bytes; the completion is purely a delivery signal. A stray
-         * metadata-announcement or credit-return arriving mid-step (from a
-         * neighbour starting its own cache-miss exchange early) is handled
-         * inline by ag_poll_once() without disturbing got_send/got_recv. */
-        int got_send = 0, got_recv = 0, dummy_meta = 0;
-        while (got_send < nsegs_out || got_recv < nsegs_in) {
+        expected_sends += nsegs_out;
+        expected_recvs += nsegs_in;
+
+        while (got_send < expected_sends || got_recv < expected_recvs) {
             if (ag_poll_once(ctx, &got_send, &got_recv, &dummy_meta)) return -1;
         }
     }
 
-    /* ag_local_mr is NOT deregistered here -- it persists in the cache for
-     * the next call to reuse, exactly like rzv_stage_mr/eager_stage_mr.
-     * pg_close() owns its final cleanup. */
+
     return 0;
 }
 
-/* Eager uses two-sided SEND/RECV over the persistent ring QPs. Reduce-
- * Scatter receives into a reusable staging buffer; All-Gather receives
- * directly into the final recvbuf offsets. Posting receives one step at
- * a time provides flow control, without a per-call TCP handshake. */
+/* Eager uses two-sided SEND/RECV over persistent ring QPs. All receive buffers
+ * are pre-posted up front with step offsets to eliminate RNR NAK stalls. */
 
 static int post_send_data(struct ibv_qp *qp, uint64_t laddr, uint32_t lkey,
                            uint32_t len, uint64_t wr_id)
@@ -1529,49 +1451,41 @@ static int post_send_data(struct ibv_qp *qp, uint64_t laddr, uint32_t lkey,
     return ibv_post_send(qp, &wr, &bad);
 }
 
-static int post_recv_into(struct ibv_qp *qp, uint64_t laddr, uint32_t lkey,
-                           uint32_t len, uint64_t wr_id)
+
+
+typedef void (*eager_recv_cb)(void *user, uint64_t wr_id);
+
+static int eager_drain(pg_context_t *ctx, int *got_send, int *got_recv,
+                       int expected_sends, int expected_recvs,
+                       eager_recv_cb cb, void *user)
 {
-    struct ibv_sge sge = { .addr = laddr, .length = len, .lkey = lkey };
-    struct ibv_recv_wr wr, *bad;
-    memset(&wr, 0, sizeof wr);
-    wr.wr_id   = wr_id;
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
-    return ibv_post_recv(qp, &wr, &bad);
-}
+    while (*got_send < expected_sends || *got_recv < expected_recvs) {
+        struct ibv_wc wc[WC_BATCH];
+        int ne = ibv_poll_cq(ctx->cq, WC_BATCH, wc);
+        if (ne < 0) { fprintf(stderr, "poll_cq failed\n"); return -1; }
+        for (int k = 0; k < ne; k++) {
+            if (check_wc_status(ctx, &wc[k])) return -1;
+            if (wc[k].opcode == IBV_WC_SEND &&
+                (wc[k].wr_id == RZV_BARRIER_ARRIVE_WR_ID || wc[k].wr_id == RZV_BARRIER_RELEASE_WR_ID))
+                continue;
 
-/* Registration cache keyed on pointer identity: a benchmark loop or a
- * training loop calling pg_all_reduce() on the SAME sendbuf/recvbuf every
- * iteration should only pay ibv_reg_mr() once, not once per call. */
-static struct ibv_mr *get_cached_mr(pg_context_t *ctx, void *buf, size_t bytes)
-{
-    if (ctx->eager_mr && ctx->eager_mr_ptr == buf && ctx->eager_mr_size >= bytes)
-        return ctx->eager_mr;
-
-    if (ctx->eager_mr) { ibv_dereg_mr(ctx->eager_mr); ctx->eager_mr = NULL; }
-
-    ctx->eager_mr = ibv_reg_mr(ctx->pd, buf, bytes, IBV_ACCESS_LOCAL_WRITE);
-    ctx->eager_mr_ptr  = buf;
-    ctx->eager_mr_size = bytes;
-    return ctx->eager_mr;
-}
-
-static struct ibv_mr *get_cached_send_mr(pg_context_t *ctx, void *buf, size_t bytes)
-{
-    if (ctx->eager_send_mr && ctx->eager_send_mr_ptr == buf &&
-        ctx->eager_send_mr_size >= bytes)
-        return ctx->eager_send_mr;
-
-    if (ctx->eager_send_mr) {
-        ibv_dereg_mr(ctx->eager_send_mr);
-        ctx->eager_send_mr = NULL;
+            if (wc[k].qp_num == ctx->qp_next->qp_num) {
+                (*got_send)++;
+            } else if (wc[k].qp_num == ctx->qp_prev->qp_num) {
+                (*got_recv)++;
+                if (cb) cb(user, wc[k].wr_id);
+            }
+        }
     }
+    return 0;
+}
 
-    ctx->eager_send_mr = ibv_reg_mr(ctx->pd, buf, bytes, 0);
-    ctx->eager_send_mr_ptr = buf;
-    ctx->eager_send_mr_size = bytes;
-    return ctx->eager_send_mr;
+static void rs_eager_recv_done(void *user, uint64_t wr_id)
+{
+    struct rs_ctx *rc_steps = user;
+    int step = (int) (wr_id >> 16);
+    uint64_t seg_i = wr_id & 0xFFFF;
+    rs_seg_cb(&rc_steps[step], seg_i);
 }
 
 static int pg_reduce_scatter_eager(pg_context_t *ctx, const void *sendbuf,
@@ -1582,10 +1496,11 @@ static int pg_reduce_scatter_eager(pg_context_t *ctx, const void *sendbuf,
     if (N == 1) return 0;
 
     size_t total_bytes = (size_t) count * esz;
-    struct ibv_mr *recv_mr = get_cached_mr(ctx, recvbuf, total_bytes);
-    struct ibv_mr *send_mr = sendbuf == recvbuf
+    struct ibv_mr *recv_mr = get_cached_mr(ctx->pd, &ctx->recv_mr_cache, recvbuf, total_bytes,
+                                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    struct ibv_mr *send_mr = (sendbuf == recvbuf)
                            ? recv_mr
-                           : get_cached_send_mr(ctx, (void *) sendbuf, total_bytes);
+                           : get_cached_mr(ctx->pd, &ctx->send_mr_cache, sendbuf, total_bytes, 0);
     if (!recv_mr) { fprintf(stderr, "rank %d: eager recvbuf MR reg failed\n", r); return -1; }
     if (!send_mr) { fprintf(stderr, "rank %d: eager sendbuf MR reg failed\n", r); return -1; }
 
@@ -1603,7 +1518,7 @@ static int pg_reduce_scatter_eager(pg_context_t *ctx, const void *sendbuf,
     for (int s = 0; s < N - 1; s++) {
         int recv_idx = ((r - s - 1) % N + N) % N;
         int r_start, r_len;
-        chunk_range(count, N, recv_idx, &r_start, &r_len);
+        partition_range(count, N, recv_idx, &r_start, &r_len);
         int nsegs_in  = r_len > 0 ? (r_len < PIPE_SEGS ? r_len : PIPE_SEGS) : 0;
         size_t step_offset = (size_t) s * max_chunk_elems * esz;
 
@@ -1615,9 +1530,9 @@ static int pg_reduce_scatter_eager(pg_context_t *ctx, const void *sendbuf,
 
         for (int i = 0; i < nsegs_in; i++) {
             int seg_start, seg_len;
-            seg_range(r_len, nsegs_in, i, &seg_start, &seg_len);
+            partition_range(r_len, nsegs_in, i, &seg_start, &seg_len);
             uint64_t addr = (uint64_t) ((char *) ctx->eager_stage + step_offset + (size_t) seg_start * esz);
-            /* קידוד השלב (s) ביחד עם האינדקס לתוך ה- wr_id */
+            /* encode step (s) and segment index into wr_id */
             uint64_t wr_id = ((uint64_t) s << 16) | (uint64_t) i;
             if (post_recv_into(ctx->qp_prev, addr, ctx->eager_stage_mr->lkey,
                                (uint32_t) (seg_len * esz), wr_id)) {
@@ -1634,15 +1549,15 @@ static int pg_reduce_scatter_eager(pg_context_t *ctx, const void *sendbuf,
         int send_idx = ((r - s) % N + N) % N;
         int recv_idx = ((r - s - 1) % N + N) % N;
         int s_start, s_len, r_start, r_len;
-        chunk_range(count, N, send_idx, &s_start, &s_len);
-        chunk_range(count, N, recv_idx, &r_start, &r_len);
+        partition_range(count, N, send_idx, &s_start, &s_len);
+        partition_range(count, N, recv_idx, &r_start, &r_len);
 
         int nsegs_out = s_len > 0 ? (s_len < PIPE_SEGS ? s_len : PIPE_SEGS) : 0;
         int nsegs_in  = r_len > 0 ? (r_len < PIPE_SEGS ? r_len : PIPE_SEGS) : 0;
 
         for (int i = 0; i < nsegs_out; i++) {
             int seg_start, seg_len;
-            seg_range(s_len, nsegs_out, i, &seg_start, &seg_len);
+            partition_range(s_len, nsegs_out, i, &seg_start, &seg_len);
             const void *source_buf = s == 0 ? sendbuf : recvbuf;
             struct ibv_mr *source_mr = s == 0 ? send_mr : recv_mr;
             uint64_t laddr = (uint64_t) ((const char *) source_buf + (size_t) (s_start + seg_start) * esz);
@@ -1660,30 +1575,7 @@ static int pg_reduce_scatter_eager(pg_context_t *ctx, const void *sendbuf,
         expected_sends += nsegs_out;
         expected_recvs += nsegs_in;
 
-        /* המתנה גלובלית - אין יותר איבוד של Completions מהעתיד! */
-        while (got_send < expected_sends || got_recv < expected_recvs) {
-            struct ibv_wc wc[WC_BATCH];
-            int ne = ibv_poll_cq(ctx->cq, WC_BATCH, wc);
-            if (ne < 0) { fprintf(stderr, "poll_cq failed\n"); return -1; }
-            for (int k = 0; k < ne; k++) {
-                if (wc[k].status != IBV_WC_SUCCESS) {
-                    fprintf(stderr, "[rank %d] WC error: %s\n", ctx->rank, ibv_wc_status_str(wc[k].status));
-                    return -1;
-                }
-                if (wc[k].opcode == IBV_WC_SEND &&
-                   (wc[k].wr_id == RZV_BARRIER_ARRIVE_WR_ID || wc[k].wr_id == RZV_BARRIER_RELEASE_WR_ID))
-                    continue;
-
-                if (wc[k].qp_num == ctx->qp_next->qp_num) {
-                    got_send++;
-                } else if (wc[k].qp_num == ctx->qp_prev->qp_num) {
-                    got_recv++;
-                    int step = (int) (wc[k].wr_id >> 16);
-                    uint64_t seg_i = wc[k].wr_id & 0xFFFF;
-                    rs_seg_cb(&rc_steps[step], seg_i); /* חישוב מובטח על ה-Context הנכון */
-                }
-            }
-        }
+        if (eager_drain(ctx, &got_send, &got_recv, expected_sends, expected_recvs, rs_eager_recv_done, rc_steps)) return -1;
     }
     return 0;
 }
@@ -1695,18 +1587,19 @@ static int pg_all_gather_eager(pg_context_t *ctx, void *recvbuf, int count, DATA
     if (N == 1) return 0;
 
     size_t total_bytes = (size_t) count * esz;
-    struct ibv_mr *recv_mr = get_cached_mr(ctx, recvbuf, total_bytes);
+    struct ibv_mr *recv_mr = get_cached_mr(ctx->pd, &ctx->recv_mr_cache, recvbuf, total_bytes,
+                                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     if (!recv_mr) { fprintf(stderr, "rank %d: eager recvbuf MR reg failed (all_gather)\n", r); return -1; }
 
     for (int s = 0; s < N - 1; s++) {
         int recv_idx = ((r - s) % N + N) % N;
         int r_start, r_len;
-        chunk_range(count, N, recv_idx, &r_start, &r_len);
+        partition_range(count, N, recv_idx, &r_start, &r_len);
         int nsegs_in  = r_len > 0 ? (r_len < PIPE_SEGS ? r_len : PIPE_SEGS) : 0;
 
         for (int i = 0; i < nsegs_in; i++) {
             int seg_start, seg_len;
-            seg_range(r_len, nsegs_in, i, &seg_start, &seg_len);
+            partition_range(r_len, nsegs_in, i, &seg_start, &seg_len);
             uint64_t addr = (uint64_t) ((char *) recvbuf + (size_t) (r_start + seg_start) * esz);
             if (post_recv_into(ctx->qp_prev, addr, recv_mr->lkey,
                                (uint32_t) (seg_len * esz), (uint64_t) i)) {
@@ -1723,15 +1616,15 @@ static int pg_all_gather_eager(pg_context_t *ctx, void *recvbuf, int count, DATA
         int send_idx = ((r - s + 1) % N + N) % N;
         int recv_idx = ((r - s) % N + N) % N;
         int s_start, s_len, r_start, r_len;
-        chunk_range(count, N, send_idx, &s_start, &s_len);
-        chunk_range(count, N, recv_idx, &r_start, &r_len);
+        partition_range(count, N, send_idx, &s_start, &s_len);
+        partition_range(count, N, recv_idx, &r_start, &r_len);
 
         int nsegs_out = s_len > 0 ? (s_len < PIPE_SEGS ? s_len : PIPE_SEGS) : 0;
         int nsegs_in  = r_len > 0 ? (r_len < PIPE_SEGS ? r_len : PIPE_SEGS) : 0;
 
         for (int i = 0; i < nsegs_out; i++) {
             int seg_start, seg_len;
-            seg_range(s_len, nsegs_out, i, &seg_start, &seg_len);
+            partition_range(s_len, nsegs_out, i, &seg_start, &seg_len);
             uint64_t laddr = (uint64_t) ((char *) recvbuf + (size_t) (s_start + seg_start) * esz);
             uint32_t wlen  = (uint32_t) (seg_len * esz);
 
@@ -1747,23 +1640,7 @@ static int pg_all_gather_eager(pg_context_t *ctx, void *recvbuf, int count, DATA
         expected_sends += nsegs_out;
         expected_recvs += nsegs_in;
 
-        while (got_send < expected_sends || got_recv < expected_recvs) {
-            struct ibv_wc wc[WC_BATCH];
-            int ne = ibv_poll_cq(ctx->cq, WC_BATCH, wc);
-            if (ne < 0) { fprintf(stderr, "poll_cq failed\n"); return -1; }
-            for (int k = 0; k < ne; k++) {
-                if (wc[k].status != IBV_WC_SUCCESS) {
-                    fprintf(stderr, "[rank %d] WC error: %s\n", ctx->rank, ibv_wc_status_str(wc[k].status));
-                    return -1;
-                }
-                if (wc[k].opcode == IBV_WC_SEND &&
-                   (wc[k].wr_id == RZV_BARRIER_ARRIVE_WR_ID || wc[k].wr_id == RZV_BARRIER_RELEASE_WR_ID))
-                    continue;
-
-                if (wc[k].qp_num == ctx->qp_next->qp_num) got_send++;
-                else if (wc[k].qp_num == ctx->qp_prev->qp_num) got_recv++;
-            }
-        }
+        if (eager_drain(ctx, &got_send, &got_recv, expected_sends, expected_recvs, NULL, NULL)) return -1;
     }
     return 0;
 }
@@ -1800,37 +1677,20 @@ static double now_ms(void)
     return t.tv_sec * 1000.0 + t.tv_nsec / 1e6;
 }
 
-/* Public API defaults to Rendezvous. The benchmark calls both internal
- * implementations explicitly so it can compare them without autotuning. */
-int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
-                   DATATYPE datatype, OPERATION op, void *pg_handle)
-{
-    pg_context_t *ctx = pg_handle;
-    if (!ctx) return -1;
-    size_t esz = dt_size(datatype);
-    if (!sendbuf || !recvbuf || esz == 0 || count <= 0 || !is_valid_operation(op)) {
-        fprintf(stderr, "pg_all_reduce: invalid buffer, count, datatype, or operation\n");
-        return -1;
-    }
-
-    return pg_all_reduce_rendezvous(ctx, sendbuf, recvbuf, count, datatype, op);
-}
-
 int pg_close(void *pg_handle)
 {
     pg_context_t *ctx = pg_handle;
     if (!ctx) return -1;
     int rc = 0;
 
-    if (ctx->eager_mr && ibv_dereg_mr(ctx->eager_mr))            { fprintf(stderr, "dereg eager_mr failed\n"); rc = -1; }
-    if (ctx->eager_send_mr && ibv_dereg_mr(ctx->eager_send_mr))  { fprintf(stderr, "dereg eager_send_mr failed\n"); rc = -1; }
     if (ctx->eager_stage_mr && ibv_dereg_mr(ctx->eager_stage_mr)) { fprintf(stderr, "dereg eager_stage_mr failed\n"); rc = -1; }
     free(ctx->eager_stage);
 
     if (ctx->rzv_stage_mr && ibv_dereg_mr(ctx->rzv_stage_mr)) { fprintf(stderr, "dereg rzv_stage_mr failed\n"); rc = -1; }
     free(ctx->rzv_stage);
 
-    if (ctx->ag_local_mr && ibv_dereg_mr(ctx->ag_local_mr))     { fprintf(stderr, "dereg ag_local_mr failed\n"); rc = -1; }
+    release_cached_mr(&ctx->recv_mr_cache);
+    release_cached_mr(&ctx->send_mr_cache);
     if (ctx->meta_send_mr && ibv_dereg_mr(ctx->meta_send_mr))   { fprintf(stderr, "dereg meta_send_mr failed\n"); rc = -1; }
     if (ctx->meta_recv_mr && ibv_dereg_mr(ctx->meta_recv_mr))   { fprintf(stderr, "dereg meta_recv_mr failed\n"); rc = -1; }
     free(ctx->meta_send_buf);
@@ -1848,6 +1708,12 @@ int pg_close(void *pg_handle)
     if (ctx->hostnames) {
         for (int i = 0; i < ctx->world_size; i++) free(ctx->hostnames[i]);
         free(ctx->hostnames);
+    }
+    for (int i = 0; i < g_config.world_size; i++) {
+        if (g_config.hostnames[i]) {
+            free(g_config.hostnames[i]);
+            g_config.hostnames[i] = NULL;
+        }
     }
     free(ctx);
     return rc;
