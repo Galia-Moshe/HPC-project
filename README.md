@@ -6,8 +6,7 @@ Verbs API and implements Reduce-Scatter, All-Gather and All-Reduce. It runs the
 same collective over an **Eager** and a **Rendezvous** protocol and measures both,
 so the two can be compared.
 
-The exercise description is in `Exercise 3 - Ring All-Reduce - RDMA.pdf`. All the
-code is in `main.c`.
+All the code is in `main.c`.
 
 ## Requirements
 
